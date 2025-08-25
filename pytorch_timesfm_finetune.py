@@ -71,7 +71,7 @@ VAL_TIMES_PER_EPOCH = 1  # How many times to run validation per epoch (1 = only 
 CHECKPOINT_DIR = SCRIPT_DIR / "finetune_checkpoints"
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 USE_LATEST_CHECKPOINT = True  # Set to True to automatically resume from latest checkpoint
-
+ 
 # Preprocessing Visualization
 VISUALIZE_PREPROCESSING = True  # Set to True to create data visualization plots
 MONTE_CARLO_SAMPLES = 10  # Number of random sequences to visualize
