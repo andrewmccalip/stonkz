@@ -531,11 +531,14 @@ source activate_uv.sh
 EPOCHS=${1:-100}
 BATCH_SIZE=${2:-32}
 PLOTS_PER_EPOCH=${3:-4}
+VAL_PLOTS=${4:-20}
+VAL_PLOT_FREQ=${5:-5}
 
 echo "📊 Configuration:"
 echo "   Epochs: $EPOCHS"
 echo "   Batch Size: $BATCH_SIZE" 
-echo "   Plots per Epoch: $PLOTS_PER_EPOCH"
+echo "   Training Plots per Epoch: $PLOTS_PER_EPOCH"
+echo "   Validation Plots: $VAL_PLOTS every $VAL_PLOT_FREQ epochs"
 echo ""
 
 # Run training
@@ -543,9 +546,12 @@ python pytorch_timesfm_finetune.py \
     --epochs $EPOCHS \
     --batch-size $BATCH_SIZE \
     --plots-per-epoch $PLOTS_PER_EPOCH \
+    --val-plots $VAL_PLOTS \
+    --val-plot-freq $VAL_PLOT_FREQ \
     --keep-plots
 
 echo "✅ Training completed!"
+echo "📁 Check validation plots in: finetune_plots/validation/"
 EOF
 
 chmod +x run_training.sh

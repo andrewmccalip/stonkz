@@ -66,6 +66,9 @@ PLOT_TIMES_PER_EPOCH = None  # If set, overrides PLOT_EVERY_ITERATIONS. E.g., 4 
 
 # Validation Configuration
 VAL_TIMES_PER_EPOCH = 1  # How many times to run validation per epoch (1 = only at end of epoch)
+CREATE_VAL_PLOTS = True  # Create validation plots during training
+VAL_PLOTS_PER_EPOCH = 20  # Number of random validation plots to create per epoch
+VAL_PLOT_FREQUENCY = 5   # Create validation plots every N epochs (set to 1 for every epoch)
 
 # Checkpoint Configuration
 CHECKPOINT_DIR = SCRIPT_DIR / "finetune_checkpoints"
@@ -648,6 +651,249 @@ def load_and_prepare_data(force_reprocess=False):
         print(f"   ⚠️ Failed to save cache: {e}")
     
     return data_dict
+
+def create_validation_plots(model, val_loader, epoch, num_plots=20, official_model=None):
+    """Create random validation plots showing history/ground truth/prediction with official TimesFM comparison."""
+    print(f"\n📊 Creating {num_plots} validation plots for epoch {epoch}...")
+    
+    # Create validation plots directory
+    val_plots_dir = PLOT_DIR / "validation"
+    val_plots_dir.mkdir(exist_ok=True)
+    
+    # Clear previous epoch's validation plots
+    for old_plot in val_plots_dir.glob(f"epoch_{epoch:03d}_*.png"):
+        old_plot.unlink()
+    
+    # Initialize official TimesFM model if not provided
+    if official_model is None:
+        print("   🤖 Initializing official TimesFM model for comparison...")
+        try:
+            import timesfm
+            official_model = timesfm.TimesFm(
+                hparams=timesfm.TimesFmHparams(
+                    backend=TIMESFM_BACKEND,
+                    per_core_batch_size=32,
+                    horizon_len=128,  # Model's default horizon
+                    num_layers=20,
+                    use_positional_embedding=True,
+                    context_len=512,  # Model's default context length
+                ),
+                checkpoint=timesfm.TimesFmCheckpoint(
+                    huggingface_repo_id=MODEL_REPO
+                ),
+            )
+            print("   ✅ Official TimesFM model loaded for validation plots")
+        except Exception as e:
+            print(f"   ⚠️ Failed to load official TimesFM model: {e}")
+            official_model = None
+    
+    model.eval()
+    with torch.no_grad():
+        # Collect all validation samples
+        all_samples = []
+        for batch_idx, batch in enumerate(val_loader):
+            inputs = batch['input'].to(DEVICE)
+            targets = batch['target'].to(DEVICE)
+            freq = batch['freq'].to(DEVICE)
+            
+            # Get predictions
+            predictions = model(inputs, freq)
+            
+            # Store samples with metadata
+            for i in range(inputs.shape[0]):
+                sample_data = {
+                    'input': inputs[i].cpu(),
+                    'target': targets[i].cpu(),
+                    'prediction': predictions[i].cpu(),
+                    'freq': freq[i].cpu(),
+                    'batch_idx': batch_idx,
+                    'sample_idx': i,
+                    'instrument_id': batch.get('instrument_id', ['Unknown'])[i] if 'instrument_id' in batch else 'Unknown',
+                    'symbol': batch.get('symbol', ['Unknown'])[i] if 'symbol' in batch else 'Unknown',
+                    'base_price': batch.get('base_price', [1.0])[i] if 'base_price' in batch else 1.0
+                }
+                all_samples.append(sample_data)
+        
+        # Randomly select samples to plot
+        if len(all_samples) < num_plots:
+            selected_samples = all_samples
+            print(f"   ⚠️ Only {len(all_samples)} validation samples available, plotting all")
+        else:
+            import random
+            selected_samples = random.sample(all_samples, num_plots)
+        
+        print(f"   📈 Creating {len(selected_samples)} individual validation plots...")
+        
+        # Create individual plots
+        for plot_idx, sample in enumerate(selected_samples):
+            fig, ax = plt.subplots(1, 1, figsize=(16, 10))
+            
+            # Extract data
+            input_patches = sample['input'].numpy()  # [num_patches, patch_features]
+            target = sample['target'].numpy()  # [horizon_len]
+            prediction = sample['prediction'].numpy()  # [horizon_len]
+            
+            # Reconstruct context from patches (taking just the price values)
+            dataset = val_loader.dataset
+            context = []
+            for i in range(dataset.num_patches):
+                patch_prices = input_patches[i, :dataset.patch_len]
+                context.extend(patch_prices)
+            context = np.array(context[:dataset.context_len])
+            
+            # Create x-axis
+            context_x = np.arange(len(context))
+            prediction_x = np.arange(len(context), len(context) + len(target))
+            
+            # Get official TimesFM prediction if available
+            official_prediction = None
+            if official_model is not None:
+                try:
+                    # Official TimesFM expects list of lists
+                    inputs_list = [context.tolist()]
+                    freq_list = [0]  # High frequency indicator
+                    official_forecast, _ = official_model.forecast(inputs_list, freq_list)
+                    official_prediction = np.array(official_forecast[0][:HORIZON_LENGTH])  # Limit to our horizon
+                except Exception as e:
+                    print(f"   ⚠️ Official TimesFM prediction failed for sample {plot_idx+1}: {e}")
+                    # Create a simple baseline as fallback
+                    if len(context) > 0:
+                        last_val = context[-1]
+                        trend = (context[-1] - context[-10]) / 10 if len(context) >= 10 else 0
+                        official_prediction = np.array([last_val + trend * i for i in range(1, HORIZON_LENGTH + 1)])
+                    else:
+                        official_prediction = None
+            
+            # Plot context (history) in blue
+            ax.plot(context_x, context, 'b-', linewidth=2, label='History (Context)', alpha=0.8)
+            
+            # Plot ground truth in black
+            ax.plot(prediction_x, target, 'k-', linewidth=3, label='Ground Truth', alpha=0.9)
+            
+            # Plot fine-tuned prediction in red
+            ax.plot(prediction_x, prediction, 'r-', linewidth=2, label='Fine-tuned TimesFM', alpha=0.8)
+            
+            # Plot official TimesFM prediction in orange if available
+            if official_prediction is not None:
+                ax.plot(prediction_x, official_prediction, 'orange', linewidth=2, label='Official TimesFM', alpha=0.7, linestyle='--')
+            
+            # Connect context to predictions with thin lines
+            if len(context) > 0 and len(target) > 0:
+                ax.plot([context_x[-1], prediction_x[0]], [context[-1], target[0]], 'k-', linewidth=1, alpha=0.3)
+                ax.plot([context_x[-1], prediction_x[0]], [context[-1], prediction[0]], 'r-', linewidth=1, alpha=0.3)
+                if official_prediction is not None:
+                    ax.plot([context_x[-1], prediction_x[0]], [context[-1], official_prediction[0]], 'orange', linewidth=1, alpha=0.3)
+            
+            # Add vertical line to separate context from predictions
+            ax.axvline(x=len(context), color='gray', linestyle='--', alpha=0.5, label='Prediction Start')
+            
+            # Calculate metrics for fine-tuned model
+            finetuned_mse = np.mean((prediction - target) ** 2)
+            finetuned_mae = np.mean(np.abs(prediction - target))
+            
+            # Directional accuracy for fine-tuned model
+            if len(target) > 1:
+                target_direction = np.sign(np.diff(target))
+                finetuned_pred_direction = np.sign(np.diff(prediction))
+                finetuned_dir_accuracy = np.mean(target_direction == finetuned_pred_direction) * 100
+            else:
+                finetuned_dir_accuracy = 50.0
+            
+            # Correlation for fine-tuned model
+            if np.std(prediction) > 1e-6 and np.std(target) > 1e-6:
+                finetuned_correlation = np.corrcoef(prediction, target)[0, 1]
+            else:
+                finetuned_correlation = 0.0
+            
+            # Calculate metrics for official model if available
+            official_mse = official_mae = official_dir_accuracy = official_correlation = None
+            if official_prediction is not None:
+                official_mse = np.mean((official_prediction - target) ** 2)
+                official_mae = np.mean(np.abs(official_prediction - target))
+                
+                if len(target) > 1:
+                    official_pred_direction = np.sign(np.diff(official_prediction))
+                    official_dir_accuracy = np.mean(target_direction == official_pred_direction) * 100
+                else:
+                    official_dir_accuracy = 50.0
+                
+                if np.std(official_prediction) > 1e-6 and np.std(target) > 1e-6:
+                    official_correlation = np.corrcoef(official_prediction, target)[0, 1]
+                else:
+                    official_correlation = 0.0
+            
+            # Price changes
+            context_change = (context[-1] - context[0]) / context[0] * 100 if len(context) > 0 and context[0] != 0 else 0
+            target_change = (target[-1] - target[0]) / target[0] * 100 if len(target) > 0 and target[0] != 0 else 0
+            finetuned_pred_change = (prediction[-1] - prediction[0]) / prediction[0] * 100 if len(prediction) > 0 and prediction[0] != 0 else 0
+            official_pred_change = (official_prediction[-1] - official_prediction[0]) / official_prediction[0] * 100 if official_prediction is not None and len(official_prediction) > 0 and official_prediction[0] != 0 else 0
+            
+            # Formatting and labels
+            ax.set_xlabel('Time Steps (Minutes)', fontsize=12)
+            ax.set_ylabel('Normalized Price', fontsize=12)
+            ax.set_title(f'Validation Sample {plot_idx+1:02d} - Epoch {epoch} - {sample["symbol"]} (ID: {sample["instrument_id"]})', 
+                        fontsize=14, fontweight='bold')
+            ax.legend(loc='upper right', fontsize=11)
+            ax.grid(True, alpha=0.3)
+            
+            # Add metrics text box with model comparison
+            if official_prediction is not None:
+                # Show comparison metrics
+                mse_improvement = ((official_mse - finetuned_mse) / official_mse * 100) if official_mse > 0 else 0
+                dir_improvement = finetuned_dir_accuracy - official_dir_accuracy
+                
+                metrics_text = (
+                    f'Fine-tuned vs Official TimesFM:\n'
+                    f'MSE: {finetuned_mse:.6f} vs {official_mse:.6f}\n'
+                    f'MAE: {finetuned_mae:.6f} vs {official_mae:.6f}\n'
+                    f'Dir. Acc: {finetuned_dir_accuracy:.1f}% vs {official_dir_accuracy:.1f}%\n'
+                    f'Corr: {finetuned_correlation:.3f} vs {official_correlation:.3f}\n\n'
+                    f'Improvements:\n'
+                    f'MSE: {mse_improvement:+.1f}%\n'
+                    f'Dir. Acc: {dir_improvement:+.1f}%\n\n'
+                    f'Price Changes:\n'
+                    f'Context: {context_change:.2f}%\n'
+                    f'Target: {target_change:.2f}%\n'
+                    f'Fine-tuned: {finetuned_pred_change:.2f}%\n'
+                    f'Official: {official_pred_change:.2f}%\n\n'
+                    f'Base Price: ${sample["base_price"]:.2f}'
+                )
+            else:
+                # Fallback to single model metrics
+                metrics_text = (
+                    f'Fine-tuned TimesFM Metrics:\n'
+                    f'MSE: {finetuned_mse:.6f}\n'
+                    f'MAE: {finetuned_mae:.6f}\n'
+                    f'Dir. Accuracy: {finetuned_dir_accuracy:.1f}%\n'
+                    f'Correlation: {finetuned_correlation:.3f}\n\n'
+                    f'Price Changes:\n'
+                    f'Context: {context_change:.2f}%\n'
+                    f'Target: {target_change:.2f}%\n'
+                    f'Predicted: {finetuned_pred_change:.2f}%\n\n'
+                    f'Base Price: ${sample["base_price"]:.2f}\n\n'
+                    f'(Official TimesFM unavailable)'
+                )
+            
+            ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes, 
+                   verticalalignment='top', fontsize=10, fontfamily='monospace',
+                   bbox=dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.8))
+            
+            # Set reasonable y-axis limits for normalized prices
+            all_values = np.concatenate([context, target, prediction])
+            y_min, y_max = np.min(all_values), np.max(all_values)
+            y_range = y_max - y_min
+            ax.set_ylim(y_min - 0.1 * y_range, y_max + 0.1 * y_range)
+            
+            # Save plot
+            plot_filename = f"epoch_{epoch:03d}_sample_{plot_idx+1:02d}_{sample['symbol']}.png"
+            plot_path = val_plots_dir / plot_filename
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight', facecolor='white')
+            plt.close()
+        
+        print(f"   ✅ Validation plots saved to: {val_plots_dir}")
+        print(f"   📁 Files: epoch_{epoch:03d}_sample_01_*.png through epoch_{epoch:03d}_sample_{len(selected_samples):02d}_*.png")
+    
+    model.train()  # Set back to training mode
 
 def create_training_plots(history, predictions_sample=None, targets_sample=None, iteration=0, 
                          model=None, official_model=None, sample_context=None, sample_freq=None, dataset=None):
@@ -1330,6 +1576,16 @@ def train_model(model, train_loader, val_loader, start_epoch=0, checkpoint_data=
         avg_val_correlation = np.mean(val_correlations) if val_correlations else 0.0
         avg_val_mse = np.mean(val_mse_components) if val_mse_components else avg_val_loss
         
+        # Create validation plots if enabled
+        if CREATE_VAL_PLOTS and (epoch + 1) % VAL_PLOT_FREQUENCY == 0:
+            print(f"\n📊 Creating validation plots for epoch {epoch + 1}...")
+            try:
+                create_validation_plots(model, val_loader, epoch + 1, num_plots=VAL_PLOTS_PER_EPOCH, official_model=official_model)
+            except Exception as e:
+                print(f"   ⚠️ Failed to create validation plots: {e}")
+                import traceback
+                traceback.print_exc()
+        
         # Update learning rate
         scheduler.step()
         
@@ -1405,7 +1661,7 @@ def train_model(model, train_loader, val_loader, start_epoch=0, checkpoint_data=
 def main():
     """Main fine-tuning pipeline."""
     # Declare globals at the start
-    global NUM_EPOCHS, BATCH_SIZE, USE_CACHED_DATA, VISUALIZE_PREPROCESSING, PLOT_TIMES_PER_EPOCH, PLOT_EVERY_ITERATIONS
+    global NUM_EPOCHS, BATCH_SIZE, USE_CACHED_DATA, VISUALIZE_PREPROCESSING, PLOT_TIMES_PER_EPOCH, PLOT_EVERY_ITERATIONS, CREATE_VAL_PLOTS, VAL_PLOTS_PER_EPOCH, VAL_PLOT_FREQUENCY
     
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Fine-tune TimesFM on stock data')
@@ -1427,6 +1683,12 @@ def main():
                         help=f'Create plots every N iterations (default: {PLOT_EVERY_ITERATIONS})')
     parser.add_argument('--resume-from', type=str, default=None,
                         help='Path to checkpoint to resume training from (e.g., /workspace/stonkz/finetune_checkpoints/best_model.pth)')
+    parser.add_argument('--val-plots', type=int, default=VAL_PLOTS_PER_EPOCH,
+                        help=f'Number of validation plots to create per epoch (default: {VAL_PLOTS_PER_EPOCH})')
+    parser.add_argument('--val-plot-freq', type=int, default=VAL_PLOT_FREQUENCY,
+                        help=f'Create validation plots every N epochs (default: {VAL_PLOT_FREQUENCY})')
+    parser.add_argument('--no-val-plots', action='store_true',
+                        help='Disable validation plot creation')
     args = parser.parse_args()
     
     # Update global config based on args
@@ -1434,10 +1696,14 @@ def main():
     BATCH_SIZE = args.batch_size
     PLOT_TIMES_PER_EPOCH = args.plots_per_epoch
     PLOT_EVERY_ITERATIONS = args.plot_every_iter
+    VAL_PLOTS_PER_EPOCH = args.val_plots
+    VAL_PLOT_FREQUENCY = args.val_plot_freq
     if args.no_cache:
         USE_CACHED_DATA = False
     if args.skip_visualization:
         VISUALIZE_PREPROCESSING = False
+    if args.no_val_plots:
+        CREATE_VAL_PLOTS = False
     
     print("🚀 PyTorch TimesFM Fine-tuning Pipeline")
     print("=" * 50)
@@ -1500,11 +1766,18 @@ def main():
     # Display plotting configuration
     print("\n📊 Plotting Configuration:")
     if PLOT_TIMES_PER_EPOCH is not None:
-        print(f"   Plots per epoch: {PLOT_TIMES_PER_EPOCH}")
+        print(f"   Training plots per epoch: {PLOT_TIMES_PER_EPOCH}")
         print(f"   Mode: Evenly spaced throughout each epoch")
     else:
-        print(f"   Plot every: {PLOT_EVERY_ITERATIONS} iterations")
+        print(f"   Training plot every: {PLOT_EVERY_ITERATIONS} iterations")
         print(f"   Mode: Fixed iteration interval")
+    
+    print(f"\n📊 Validation Plotting:")
+    if CREATE_VAL_PLOTS:
+        print(f"   Validation plots enabled: {VAL_PLOTS_PER_EPOCH} plots every {VAL_PLOT_FREQUENCY} epochs")
+        print(f"   Plot directory: {PLOT_DIR / 'validation'}")
+    else:
+        print(f"   Validation plots disabled")
     print("=" * 50)
 
     # Load data first

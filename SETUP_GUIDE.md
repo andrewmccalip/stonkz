@@ -95,14 +95,28 @@ source .venv/bin/activate
 source activate_uv.sh
 
 # Quick training run
-./run_training.sh 100 32 4  # epochs, batch_size, plots_per_epoch
+./run_training.sh 100 32 4 20 5  # epochs, batch_size, plots_per_epoch, val_plots, val_plot_freq
 
 # Manual training with custom parameters
 python pytorch_timesfm_finetune.py \
     --epochs 500 \
     --batch-size 64 \
     --plots-per-epoch 2 \
+    --val-plots 20 \
+    --val-plot-freq 5 \
     --keep-plots
+
+# Disable validation plots for faster training
+python pytorch_timesfm_finetune.py \
+    --epochs 100 \
+    --batch-size 32 \
+    --no-val-plots
+
+# Create validation plots every epoch (more frequent monitoring)
+python pytorch_timesfm_finetune.py \
+    --epochs 50 \
+    --val-plots 15 \
+    --val-plot-freq 1
 ```
 
 ### Environment Management
