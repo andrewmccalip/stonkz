@@ -1,0 +1,55 @@
+[project]
+name = "flamingo-timesfm-finetuning"
+version = "0.1.0"
+description = "FlaMinGo TimesFM Stock Market Finetuning"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # Core ML/AI packages
+    "torch>=2.0.0",
+    "transformers==4.49.0",
+    "scikit-learn==1.7.1",
+    
+    # JAX (required for TimesFM backend)
+    "jax==0.7.1",
+    "jaxlib==0.7.1",
+    
+    # Data processing
+    "pandas==2.3.1",
+    "numpy>=1.26.4,<2.0.0",
+    "pyarrow==20.0.0",
+    
+    # Plotting and visualization
+    "matplotlib==3.10.5",
+    "seaborn==0.13.2",
+    
+    # Utilities
+    "python-dotenv==1.1.1",
+    "pytz==2025.2",
+    "tqdm==4.67.1",
+    
+    # HuggingFace ecosystem
+    "huggingface-hub>=0.20.0",
+    "tokenizers>=0.15.0",
+    "safetensors>=0.4.0",
+    
+    # TimesFM dependencies
+    "einshape>=1.0.0",
+    "utilsforecast>=0.1.10",
+    "typer>=0.12.3",
+    "absl-py>=1.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = []
+
+# [tool.uv.sources]
+# We'll install TimesFM separately after the main dependencies

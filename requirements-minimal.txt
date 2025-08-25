@@ -1,0 +1,35 @@
+# Core ML/AI packages
+torch==2.8.0
+transformers==4.49.0
+scikit-learn==1.7.1
+
+# TimesFM (FlaMinGo) - Required for finetuning and inference
+-e git+https://huggingface.co/PartAI/FlaMinGo-timesfm@bc45674bf0c36dc324731151a40af7d82b9e8046#egg=timesfm
+
+# JAX (required for TimesFM backend)
+jax==0.7.1
+jaxlib==0.7.1
+
+# Data processing
+pandas==2.3.1
+numpy==1.26.4
+pyarrow==20.0.0
+
+# Plotting and visualization
+matplotlib==3.10.5
+seaborn==0.13.2
+
+# Utilities
+python-dotenv==1.1.1
+pytz==2025.2
+tqdm==4.67.1
+
+# HuggingFace ecosystem (for model loading)
+huggingface-hub>=0.20.0
+tokenizers>=0.15.0
+safetensors>=0.4.0
+
+# Additional ML utilities (used in training)
+# These are typically installed as dependencies but listing for clarity
+# scipy  # Usually comes with scikit-learn
+# joblib  # Usually comes with scikit-learn
