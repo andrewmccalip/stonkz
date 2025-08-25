@@ -78,7 +78,7 @@ MONTE_CARLO_SAMPLES = 10  # Number of random sequences to visualize
 
 # Caching Configuration
 USE_CACHED_DATA = True  # Set to False to force data reprocessing
-CACHE_VERSION = "v2"  # Increment this to invalidate old caches
+CACHE_VERSION = "v3"  # Increment this to invalidate old caches
 
 # Loss Configuration
 USE_DIRECTIONAL_LOSS = True  # Enable directional accuracy in loss function
