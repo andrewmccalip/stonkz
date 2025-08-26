@@ -42,7 +42,7 @@ PREDICTION_HORIZON = 96
 USE_NORMALIZED_PRICES = True
 
 # Test Configuration
-TEST_DATE = '2010-09-07'  # Fixed date for testing
+TEST_DATE = '2011-09-09'  # Fixed date for testing
 TEST_TIME_PT = '10:00'    # 10:00 AM Pacific Time
 
 # Colors
