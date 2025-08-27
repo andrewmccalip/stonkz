@@ -108,7 +108,8 @@ TRAINING_CONFIG = {
     "freq_type": 0,          # High frequency (minute data)
     "use_quantile_loss": True,
     "log_every_n_steps": 10,
-    "val_check_interval": 0.5,  # Validate twice per epoch
+    "val_check_interval": 0.5,  # Original finetuner param, not used in our verbose loop
+    "validate_every_n_epochs": 5, # Run validation every 5 epochs
     "use_wandb": False,      # Disabled for testing
     "wandb_project": "timesfm2-es-futures",
 }
@@ -116,7 +117,7 @@ TRAINING_CONFIG = {
 # Sample configuration (for testing)
 SAMPLE_CONFIG = {
     "use_sample": True,      # Use random sample instead of full dataset
-    "total_sequences": 5000, # Total sequences to use
+    "total_sequences": 1000, # Total sequences to use
     "train_ratio": 0.7,      # 70% for training
     "val_ratio": 0.2,        # 20% for validation  
     "test_ratio": 0.1,       # 10% for testing
@@ -469,6 +470,10 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Store horizon_len directly on the instance for easy access
+        self.horizon_len = MODEL_CONFIG["horizon_len"]
+        self.context_len = MODEL_CONFIG["context_len"]
+        self.criterion = self._create_criterion()
         self.training_history = {
             'train_loss': [],
             'val_loss': [],
@@ -500,19 +505,60 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         self.tensorboard_writer = None
         self.global_step = 0
         
+    def _create_criterion(self):
+        """Creates the loss function based on the finetuning configuration."""
+        if self.config.use_quantile_loss:
+            # This is a common loss function for probabilistic forecasting
+            return nn.L1Loss()  # Using L1 for quantile loss as a robust choice
+        else:
+            # Standard Mean Squared Error for point forecasts
+            return nn.MSELoss()
+
+    def _process_batch(self, batch: Tuple) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Process a single batch of data, returning loss and predictions."""
+        context, padding, freq, horizon = batch
+        context, padding, freq, horizon = (
+            context.to(self.device),
+            padding.to(self.device),
+            freq.to(self.device),
+            horizon.to(self.device),
+        )
+
+        # Forward pass
+        predictions_raw = self.model(context, padding.float(), freq)
+
+        # The model output is likely [batch, patches, horizon, distribution].
+        # We need the point forecast for loss, which is usually the first element
+        # in the last dimension.
+        if predictions_raw.ndim == 4 and predictions_raw.shape[2] == self.horizon_len:
+             # This aligns with the error: [200, 13, 128, 10] -> take the mean over the last dim, but lets select the last patch
+            predictions = predictions_raw[:, -1, :, 0]
+
+        else:
+            # If the shape is already correct or different, use it as is
+            predictions = predictions_raw
+
+        # Ensure prediction and horizon shapes match before loss calculation
+        if predictions.shape != horizon.shape:
+             raise ValueError(
+                f"Shape mismatch for loss: pred {predictions.shape} vs horizon {horizon.shape}"
+            )
+
+        loss = self.criterion(predictions, horizon)
+        return loss, predictions
+
     def _train_epoch_verbose(self, train_loader: DataLoader, optimizer: torch.optim.Optimizer, epoch: int) -> float:
-        """Train for one epoch with verbose logging"""
+        """Perform one training epoch with verbose logging"""
         
         self.model.train()
         total_loss = 0.0
+        batch_losses = []
+        self._epoch_grad_norms = []
         num_batches = len(train_loader)
-        epoch_start_time = time.time()
+        train_start_time = time.time()
         
         print(f"\n🎯 Epoch {epoch + 1}/{self.config.num_epochs}")
         print(f"   Batches: {num_batches}, Batch size: {self.config.batch_size}")
-        
-        batch_losses = []
-        self._epoch_grad_norms = []
         
         with tqdm(train_loader, desc=f"Training Epoch {epoch + 1}", leave=False) as pbar:
             for batch_idx, batch in enumerate(pbar):
@@ -568,7 +614,7 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                     continue
         
         avg_loss = total_loss / num_batches
-        epoch_time = time.time() - epoch_start_time
+        epoch_time = time.time() - train_start_time
         self.training_history['epoch_times'].append(epoch_time)
         
         # Track average gradient norm for this epoch
@@ -606,8 +652,8 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         val_targets = []
         val_contexts = []
         
-        # Store sample data for TensorBoard visualization
-        sample_data_collected = False
+        # Store ALL sample data for random selection later
+        all_sample_data = []
         
         with torch.no_grad():
             with tqdm(val_loader, desc="Validation", leave=False) as pbar:
@@ -625,11 +671,19 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                             
                             val_predictions.append(predictions.cpu())
                             val_targets.append(target_data.cpu())
+                            val_contexts.append(context_data.cpu())
                             
-                            # Collect sample data for TensorBoard (only from first batch)
-                            if not sample_data_collected and batch_idx == 0:
-                                val_contexts.append(context_data.cpu())
-                                sample_data_collected = True
+                            # Store all samples for random selection later
+                            batch_size = context_data.shape[0]
+                            for sample_idx in range(batch_size):
+                                sample_info = {
+                                    'batch_idx': batch_idx,
+                                    'sample_idx': sample_idx,
+                                    'context': context_data[sample_idx].cpu(),
+                                    'predictions': predictions[sample_idx].cpu(),
+                                    'targets': target_data[sample_idx].cpu()
+                                }
+                                all_sample_data.append(sample_info)
                         
                         pbar.set_postfix({'Val Loss': f'{batch_loss:.6f}'})
                         
@@ -647,107 +701,84 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                 all_predictions = torch.cat(val_predictions, dim=0)
                 all_targets = torch.cat(val_targets, dim=0)
                 
-                # Calculate metrics - ensure tensors have matching shapes
-                # Flatten if needed to handle shape mismatches
+                # The shape should now be correct from _process_batch, but we'll keep this
+                # as a safeguard, though it might not be needed.
                 if all_predictions.shape != all_targets.shape:
-                    print(f"   🔧 Shape mismatch detected: pred {all_predictions.shape} vs target {all_targets.shape}")
-                    # Take minimum dimensions to align shapes
-                    min_batch = min(all_predictions.shape[0], all_targets.shape[0])
-                    min_seq = min(all_predictions.shape[1], all_targets.shape[1])
-                    all_predictions = all_predictions[:min_batch, :min_seq]
-                    all_targets = all_targets[:min_batch, :min_seq]
-                    print(f"   🔧 Aligned shapes to: {all_predictions.shape}")
-                
-                mse = torch.mean((all_predictions - all_targets) ** 2).item()
-                mae = torch.mean(torch.abs(all_predictions - all_targets)).item()
-                
-                # Directional accuracy - ensure we have enough timesteps
-                if all_predictions.shape[1] > 1:
-                    pred_direction = (all_predictions[:, 1:] > all_predictions[:, :-1]).float()
-                    true_direction = (all_targets[:, 1:] > all_targets[:, :-1]).float()
-                    dir_accuracy = (pred_direction == true_direction).float().mean().item()
+                    print(f"   ⚠️ Shape mismatch in validation metrics: pred {all_predictions.shape} vs target {all_targets.shape}")
                 else:
-                    dir_accuracy = 0.5  # Default to 50% if only one timestep
-                
-                # Correlation
-                correlations = []
-                for i in range(all_predictions.shape[0]):
-                    pred_i = all_predictions[i].numpy()
-                    target_i = all_targets[i].numpy()
-                    if np.std(pred_i) > 1e-6 and np.std(target_i) > 1e-6:
-                        corr = np.corrcoef(pred_i, target_i)[0, 1]
-                        if not np.isnan(corr):
-                            correlations.append(corr)
-                
-                avg_correlation = np.mean(correlations) if correlations else 0.0
-                
-                # Store metrics
-                self.performance_metrics['mse'].append(mse)
-                self.performance_metrics['mae'].append(mae)
-                self.performance_metrics['directional_accuracy'].append(dir_accuracy)
-                self.performance_metrics['correlation'].append(avg_correlation)
-                
-                print(f"   📊 Val Metrics: MSE={mse:.6f}, MAE={mae:.6f}, Dir.Acc={dir_accuracy:.1%}, Corr={avg_correlation:.3f}")
-                
-                # TensorBoard logging for validation metrics
-                if self.tensorboard_writer is not None:
-                    self.tensorboard_writer.add_scalar('Validation/MSE', mse, epoch)
-                    self.tensorboard_writer.add_scalar('Validation/MAE', mae, epoch)
-                    self.tensorboard_writer.add_scalar('Validation/DirectionalAccuracy', dir_accuracy, epoch)
-                    self.tensorboard_writer.add_scalar('Validation/Correlation', avg_correlation, epoch)
+                    mse = torch.mean((all_predictions - all_targets) ** 2).item()
+                    mae = torch.mean(torch.abs(all_predictions - all_targets)).item()
                     
-                    # Create prediction visualization plots for TensorBoard
-                    if val_contexts and val_predictions and val_targets:
+                    # Calculate directional accuracy and correlation
+                    dir_acc = self.calculate_directional_accuracy(all_predictions, all_targets)
+                    corr = self.calculate_correlation(all_predictions, all_targets)
+                    
+                    # Store metrics
+                    self.performance_metrics['mse'].append(mse)
+                    self.performance_metrics['mae'].append(mae)
+                    self.performance_metrics['directional_accuracy'].append(dir_acc)
+                    self.performance_metrics['correlation'].append(corr)
+                    
+                    print(f"   📈 Val Metrics - MSE: {mse:.6f}, MAE: {mae:.6f}, Dir.Acc: {dir_acc:.1%}, Corr: {corr:.3f}")
+                    
+                    # TensorBoard logging
+                    if self.tensorboard_writer is not None:
+                        self.tensorboard_writer.add_scalar('Epoch/ValMSE', mse, epoch)
+                        self.tensorboard_writer.add_scalar('Epoch/ValMAE', mae, epoch)
+                        self.tensorboard_writer.add_scalar('Epoch/ValDirectionalAccuracy', dir_acc, epoch)
+                        self.tensorboard_writer.add_scalar('Epoch/ValCorrelation', corr, epoch)
+                        
+                        # Plot prediction samples to TensorBoard
                         try:
-                            # Create individual sample prediction plots
-                            num_samples = min(3, len(val_predictions[0]))  # Show up to 3 samples
-                            
-                            for sample_idx in range(num_samples):
-                                img_array = self.create_prediction_plot(
-                                    context_data=val_contexts[0],
-                                    predictions=val_predictions[0], 
-                                    targets=val_targets[0],
-                                    epoch=epoch,
-                                    sample_idx=sample_idx
-                                )
-                                
-                                if img_array is not None:
-                                    self.tensorboard_writer.add_image(
-                                        f'Predictions/Individual/Sample_{sample_idx+1}',
-                                        img_array,
-                                        epoch,
-                                        dataformats='HWC'
-                                    )
-                            
-                            # Create multi-sample comparison plot
-                            multi_img_array = self.create_multi_sample_prediction_plot(
-                                context_data=val_contexts[0],
-                                predictions=val_predictions[0], 
-                                targets=val_targets[0],
+                            # The data is already a numpy array in latest_sample_data
+                            context_data = self.latest_sample_data['context']
+                            predictions_data = self.latest_sample_data['predictions']
+                            targets_data = self.latest_sample_data['targets']
+
+                            # Use the single-sample plot function which is designed for this
+                            img_array = self.create_prediction_plot(
+                                context_data=context_data,
+                                predictions=predictions_data,
+                                targets=targets_data,
                                 epoch=epoch,
-                                num_samples=num_samples
+                                sample_idx=0  # The data is a single sample
                             )
                             
-                            if multi_img_array is not None:
+                            if img_array is not None:
                                 self.tensorboard_writer.add_image(
-                                    'Predictions/MultiSample/Comparison',
-                                    multi_img_array,
+                                    'Predictions/RandomValidationSample',
+                                    img_array,
                                     epoch,
                                     dataformats='HWC'
                                 )
-                            
-                            print(f"   📊 Added {num_samples} individual + 1 multi-sample prediction plots to TensorBoard")
-                            
-                            # Store sample data for comprehensive plotting
-                            self.latest_sample_data = {
-                                'context': val_contexts[0][0].numpy(),  # First sample context
-                                'predictions': val_predictions[0][0].numpy(),  # First sample predictions
-                                'targets': val_targets[0][0].numpy(),  # First sample targets
-                                'epoch': epoch
-                            }
+                                print(f"   📊 Added random validation sample plot to TensorBoard")
                             
                         except Exception as e:
                             print(f"   ⚠️ Error creating TensorBoard prediction plots: {e}")
+                
+                # --- This is the new, consolidated plotting logic ---
+                if all_sample_data:
+                    try:
+                        import random
+                        # 1. Randomly select ONE sample for this validation run
+                        random_sample = random.choice(all_sample_data)
+                        print(f"   🎲 Selected random sample for plotting (Batch {random_sample['batch_idx']}, Sample {random_sample['sample_idx']})")
+                        
+                        # 2. Store this sample's data for the comprehensive dashboard plot
+                        self.latest_sample_data = {
+                            'context': random_sample['context'].numpy(),
+                            'predictions': random_sample['predictions'].numpy(),
+                            'targets': random_sample['targets'].numpy(),
+                            'epoch': epoch,
+                            'batch_idx': random_sample['batch_idx'],
+                            'sample_idx': random_sample['sample_idx']
+                        }
+
+                        # 3. Create the new, detailed "full screen" plot for this specific random sample
+                        self.create_detailed_validation_plot(random_sample, epoch)
+
+                    except Exception as e:
+                        print(f"   ⚠️ Error processing random sample for plotting: {e}")
                 
             except Exception as e:
                 print(f"   ⚠️ Error calculating performance metrics: {e}")
@@ -766,21 +797,25 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         """Create a plot showing context + prediction + ground truth for TensorBoard"""
         
         try:
+            # --- Robust Data Handling ---
+            # Ensure all data is in NumPy format first.
+            context_numpy = context_data.cpu().numpy() if torch.is_tensor(context_data) else np.array(context_data)
+            predictions_numpy = predictions.cpu().numpy() if torch.is_tensor(predictions) else np.array(predictions)
+            targets_numpy = targets.cpu().numpy() if torch.is_tensor(targets) else np.array(targets)
+            
+            # Select the specific sample if the data is batched.
+            if context_numpy.ndim > 1:
+                context = context_numpy[sample_idx]
+                pred = predictions_numpy[sample_idx]
+                target = targets_numpy[sample_idx]
+            else:
+                # Data is already a single sample.
+                context = context_numpy
+                pred = predictions_numpy
+                target = targets_numpy
+
             # Create figure for the prediction plot
             fig, ax = plt.subplots(1, 1, figsize=(12, 6))
-            
-            # Convert tensors to numpy if needed
-            if torch.is_tensor(context_data):
-                context_data = context_data.cpu().numpy()
-            if torch.is_tensor(predictions):
-                predictions = predictions.cpu().numpy()
-            if torch.is_tensor(targets):
-                targets = targets.cpu().numpy()
-            
-            # Take the first sample from the batch
-            context = context_data[sample_idx] if len(context_data.shape) > 1 else context_data
-            pred = predictions[sample_idx] if len(predictions.shape) > 1 else predictions
-            target = targets[sample_idx] if len(targets.shape) > 1 else targets
             
             # Create time axis
             context_len = len(context)
@@ -950,7 +985,14 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                     corr = self.performance_metrics['correlation'][-1]
                     current_metrics += f", Corr: {corr:.3f}"
             
-            title = f"TimesFM Fine-tuning - Epoch {epoch+1}"
+            # Add sample information to title
+            sample_info = ""
+            if 'batch_idx' in self.latest_sample_data and 'sample_idx' in self.latest_sample_data:
+                batch_idx = self.latest_sample_data['batch_idx']
+                sample_idx = self.latest_sample_data['sample_idx']
+                sample_info = f" (Random Sample: Batch {batch_idx}, Sample {sample_idx})"
+            
+            title = f"TimesFM Fine-tuning - Epoch {epoch+1}{sample_info}"
             if current_metrics:
                 title += f"\n{current_metrics}"
             
@@ -982,7 +1024,6 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                     try:
                         # Read the saved plot and add to TensorBoard
                         from PIL import Image
-                        import numpy as np
                         
                         img = Image.open(result['plot_path'])
                         img_array = np.array(img)
@@ -991,27 +1032,17 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                         if len(img_array.shape) == 3 and img_array.shape[2] == 4:  # RGBA
                             img_array = img_array[:, :, :3]  # Convert to RGB
                         
+                        # Use a clear, standardized tag for this plot
                         self.tensorboard_writer.add_image(
-                            'Comprehensive_Plots/Epoch_Summary',
+                            'Validation/Comprehensive_Dashboard',
                             img_array,
                             epoch,
                             dataformats='HWC'
                         )
-                        
-                        # Also add with a unique tag for each epoch
-                        self.tensorboard_writer.add_image(
-                            f'Comprehensive_Plots/Epoch_{epoch+1:03d}',
-                            img_array,
-                            epoch,
-                            dataformats='HWC'
-                        )
-                        
-                        print(f"   📊 Comprehensive plot added to TensorBoard (2 views)")
+                        print(f"   📈 Comprehensive validation dashboard logged to TensorBoard.")
                         
                     except Exception as e:
                         print(f"   ⚠️ Error adding comprehensive plot to TensorBoard: {e}")
-                        import traceback
-                        print(f"   🔍 Traceback: {traceback.format_exc()}")
                 
                 return result['plot_path']
             else:
@@ -1082,7 +1113,7 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
             print(f"   ❌ Error creating training evolution plot: {e}")
             return None
     
-    def plot_training_progress(self, save_path: Optional[Path] = None):
+    def plot_training_progress(self, latest_sample_data: Optional[Dict] = None, save_path: Optional[Path] = None):
         """Create comprehensive training dashboard matching the reference layout"""
         
         if len(self.training_history['train_loss']) == 0:
@@ -1180,23 +1211,33 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         
         # Plot 5: Sample Prediction vs Target (Middle Center)
         ax5 = fig.add_subplot(gs[1, 1])
-        # Simulate sample predictions vs targets
-        time_steps = np.arange(0, 60, 1)
-        
-        # Create realistic target and prediction data
-        np.random.seed(42)
-        target = 1.0 + 0.01 * np.cumsum(np.random.randn(60))
-        prediction = target + 0.005 * np.random.randn(60)  # Add some noise
-        
-        ax5.plot(time_steps, target, 'b-', label='Target', linewidth=2, alpha=0.8)
-        ax5.plot(time_steps, prediction, 'orange', label='Prediction', linewidth=2, alpha=0.8)
-        
+        if latest_sample_data and latest_sample_data.get('context') is not None:
+            # Use the real data from the latest validation sample
+            context = latest_sample_data['context']
+            prediction = latest_sample_data['predictions']
+            target = latest_sample_data['targets']
+            
+            context_len = len(context)
+            pred_len = len(prediction)
+            
+            context_time = np.arange(0, context_len)
+            pred_time = np.arange(context_len, context_len + pred_len)
+
+            ax5.plot(context_time, context, 'b-', label='Context', linewidth=2, alpha=0.8)
+            ax5.plot(pred_time, target, 'g-', label='Target', linewidth=2, alpha=0.8)
+            ax5.plot(pred_time, prediction, 'orange', label='Prediction', linewidth=2, alpha=0.8)
+            ax5.axvline(x=context_len, color='black', linestyle='--', alpha=0.5)
+
+        else:
+            # Fallback to placeholder if no sample data is available
+            ax5.text(0.5, 0.5, 'No validation sample\navailable yet', 
+                     transform=ax5.transAxes, ha='center', va='center', fontsize=12, alpha=0.6)
+
         ax5.set_xlabel('Time Steps')
         ax5.set_ylabel('Normalized Price')
         ax5.set_title('Sample Prediction vs Target', fontweight='bold')
         ax5.legend()
         ax5.grid(True, alpha=0.3)
-        ax5.set_ylim(0.98, 1.02)
         
         # Plot 6: Prediction Error Distribution (Middle Right)
         ax6 = fig.add_subplot(gs[1, 2])
@@ -1317,10 +1358,10 @@ Degradation: +-8.0%"""
         # Log to TensorBoard
         if self.tensorboard_writer is not None:
             try:
-                # Convert plot to image for TensorBoard (compatible with newer matplotlib)
+                # Convert plot to image for TensorBoard
                 import io
                 buf = io.BytesIO()
-                fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+                fig.savefig(buf, format='png', dpi=120, bbox_inches='tight') # Use slightly higher DPI for clarity
                 buf.seek(0)
                 
                 # Convert to numpy array
@@ -1328,12 +1369,13 @@ Degradation: +-8.0%"""
                 img = Image.open(buf)
                 fig_array = np.array(img)
                 
-                # Add image to TensorBoard (HWC format)
+                # Add image to TensorBoard with a clear tag
                 current_epoch = len(self.training_history['train_loss']) - 1
-                self.tensorboard_writer.add_image('Training/ProgressPlot', fig_array, current_epoch, dataformats='HWC')
+                self.tensorboard_writer.add_image('Training/Main_Dashboard', fig_array, current_epoch, dataformats='HWC')
                 buf.close()
+                print("   📈 Training dashboard successfully logged to TensorBoard.")
             except Exception as e:
-                print(f"   ⚠️ Could not log plot to TensorBoard: {e}")
+                print(f"   ⚠️ Could not log training dashboard to TensorBoard: {e}")
         
         plt.close()
         
@@ -1389,18 +1431,22 @@ Degradation: +-8.0%"""
             'device': str(self.device)
         }
         
-        # Log model architecture (try to get a sample input for the graph)
-        try:
-            sample_batch = next(iter(train_loader))
-            sample_input = (
-                sample_batch['context'].to(self.device)[:1],  # Take first sample
-                sample_batch['context_padding'].to(self.device)[:1],
-                sample_batch['freq'].to(self.device)[:1]
-            )
-            self.tensorboard_writer.add_graph(self.model, sample_input)
-            print("   📊 Model graph logged to TensorBoard")
-        except Exception as e:
-            print(f"   ⚠️ Could not log model graph: {e}")
+        # TensorBoard logging
+        if self.tensorboard_writer:
+            try:
+                # Note: Creating a dummy input for the graph. This might not perfectly 
+                # represent the actual model input structure if it's complex.
+                dummy_context = torch.randn(1, self.context_len, device=self.device)
+                dummy_padding = torch.zeros(1, self.context_len, device=self.device)
+                dummy_freq = torch.zeros(1, 1, dtype=torch.long, device=self.device)
+                
+                self.tensorboard_writer.add_graph(self.model, [
+                    dummy_context,
+                    dummy_padding,
+                    dummy_freq
+                ])
+            except Exception as e:
+                print(f"   ⚠️ Could not log model graph: {e}")
         
         self.tensorboard_writer.add_hparams(hparams, {})
         
@@ -1413,43 +1459,44 @@ Degradation: +-8.0%"""
                 train_loss = self._train_epoch_verbose(train_loader, optimizer, epoch)
                 self.training_history['train_loss'].append(train_loss)
                 
-                # Validation
-                val_loss = self._validate_verbose(val_loader, epoch)
-                self.training_history['val_loss'].append(val_loss)
-                
-                # Track learning rate
-                current_lr = optimizer.param_groups[0]['lr']
-                self.learning_rates.append(current_lr)
-                
-                # TensorBoard logging for learning rate
-                if self.tensorboard_writer is not None:
-                    self.tensorboard_writer.add_scalar('Epoch/LearningRate', current_lr, epoch)
-                
-                # Track best model
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_epoch = epoch
-                    print(f"   🌟 New best validation loss: {val_loss:.6f}")
-                
-                # Plot progress - dashboard every 2 epochs
-                if (epoch + 1) % 2 == 0 or epoch == self.config.num_epochs - 1:
-                    self.plot_training_progress()
-                
-                # Create comprehensive prediction plots every 2 epochs (more frequent)
-                if (epoch + 1) % 2 == 0 or epoch == self.config.num_epochs - 1:
+                # --- Validation and Plotting Step ---
+                # We will only run validation and plotting every N epochs for efficiency
+                if (epoch + 1) % self.config.validate_every_n_epochs == 0:
+                    
+                    # Validation
+                    val_loss = self._validate_verbose(val_loader, epoch)
+                    self.training_history['val_loss'].append(val_loss)
+                    
+                    # Track learning rate
+                    current_lr = optimizer.param_groups[0]['lr']
+                    self.learning_rates.append(current_lr)
+                    
+                    # TensorBoard logging for learning rate
+                    if self.tensorboard_writer is not None:
+                        self.tensorboard_writer.add_scalar('Epoch/LearningRate', current_lr, epoch)
+                    
+                    # Track best model
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_epoch = epoch
+                        print(f"   🌟 New best validation loss: {val_loss:.6f}")
+                    
+                    # Plot progress - dashboard every validation run
+                    self.plot_training_progress(latest_sample_data=self.latest_sample_data)
+                    
+                    # Create comprehensive prediction plots (dashboard style)
                     comprehensive_plot_path = self.create_comprehensive_prediction_plot(epoch)
                     if comprehensive_plot_path:
-                        print(f"   📊 Comprehensive prediction plot created for epoch {epoch + 1}")
-                        print(f"   📊 Plot saved to: {comprehensive_plot_path}")
+                        print(f"   📊 Dashboard plot created for epoch {epoch + 1}: {comprehensive_plot_path}")
                     else:
-                        print(f"   ⚠️ Failed to create comprehensive plot for epoch {epoch + 1}")
-                
-                # Create training evolution plots every 10 epochs
-                if (epoch + 1) % 10 == 0 or epoch == self.config.num_epochs - 1:
-                    evolution_plot_path = self.create_training_evolution_plot(epoch)
-                    if evolution_plot_path:
-                        print(f"   📊 Training evolution plot created for epoch {epoch + 1}")
-                
+                        print(f"   ⚠️ Failed to create comprehensive dashboard plot for epoch {epoch + 1}")
+
+                else:
+                    # For epochs where we skip validation, carry forward the last validation loss for consistent plotting
+                    last_val_loss = self.training_history['val_loss'][-1] if self.training_history['val_loss'] else float('nan')
+                    self.training_history['val_loss'].append(last_val_loss)
+                    print(f"   ⏩ Skipping validation for epoch {epoch + 1} (runs every {self.config.validate_every_n_epochs} epochs)")
+
                 # Summary
                 elapsed_time = time.time() - self.start_time
                 print(f"   ⏱️  Total elapsed: {elapsed_time:.2f}s, ETA: {elapsed_time/(epoch+1)*(self.config.num_epochs-epoch-1):.2f}s")
@@ -1523,6 +1570,100 @@ Degradation: +-8.0%"""
             'tensorboard_dir': str(tensorboard_run_dir) if self.tensorboard_writer else None
         }
 
+    def calculate_directional_accuracy(self, predictions: torch.Tensor, targets: torch.Tensor) -> float:
+        """Calculates the directional accuracy between predictions and targets."""
+        pred_diff = torch.diff(predictions, dim=-1)
+        target_diff = torch.diff(targets, dim=-1)
+        correct_direction = (torch.sign(pred_diff) == torch.sign(target_diff)).float().mean().item()
+        return correct_direction
+
+    def calculate_correlation(self, predictions: torch.Tensor, targets: torch.Tensor) -> float:
+        """Calculates the correlation between predictions and targets."""
+        # Flatten the tensors to treat them as two long series
+        pred_flat = predictions.flatten()
+        target_flat = targets.flatten()
+        
+        # Calculate correlation using PyTorch
+        vx = pred_flat - torch.mean(pred_flat)
+        vy = target_flat - torch.mean(target_flat)
+        
+        cost = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)))
+        return cost.item()
+
+    def create_detailed_validation_plot(self, sample_data: Dict, epoch: int):
+        """
+        Creates a detailed validation plot for a single sample, showing historical context,
+        ground truth, and the model's prediction, similar to the main prediction scripts.
+        """
+        if not PLOTTING_AVAILABLE:
+            return
+
+        try:
+            # The plotting function is imported from our shared plotting module
+            from plotting import plot_prediction_results
+            
+            # --- Prepare Data for Plotting ---
+            # The context data is in patches [num_patches, patch_len], so we flatten it
+            # to get the continuous historical sequence.
+            context_data = sample_data['context'].cpu().numpy().flatten()
+            prediction_data = sample_data['predictions'].cpu().numpy()
+            ground_truth_data = sample_data['targets'].cpu().numpy()
+            
+            batch_idx = sample_data.get('batch_idx', 0)
+            sample_idx = sample_data.get('sample_idx', 0)
+
+            # Create a dedicated directory for these detailed plots to keep them organized
+            plot_dir = FINETUNE_PLOTS_DIR / "validation_details"
+            plot_dir.mkdir(exist_ok=True)
+            
+            save_path = plot_dir / f"validation_epoch_{epoch+1:03d}_b{batch_idx}_s{sample_idx}.png"
+            
+            title = f"Finetune Validation Sample - Epoch {epoch+1}\n(Source: Batch {batch_idx}, Sample {sample_idx})"
+
+            # --- Call the Plotting Function ---
+            # This is the same function used by prediction_kronos.py and prediction_timesfm_v2.py
+            plot_result = plot_prediction_results(
+                context_data=context_data,
+                prediction_data=prediction_data,
+                ground_truth_data=ground_truth_data,
+                title=title,
+                model_name="TimesFM Fine-tuned",
+                save_path=save_path,
+                show_plot=False,  # We are saving the file, not showing it interactively
+                verbose=False
+            )
+            print(f"   🖼️  Detailed validation plot saved: {save_path}")
+
+            # Also save this plot as the "latest" for easy access
+            latest_path = plot_dir / "latest_val.png"
+            import shutil
+            shutil.copy(save_path, latest_path)
+            print(f"   ➡️  Copied to: {latest_path}")
+
+            # Log the detailed plot to TensorBoard as well
+            if self.tensorboard_writer and plot_result and plot_result.get('plot_path'):
+                try:
+                    from PIL import Image
+                    img = Image.open(plot_result['plot_path'])
+                    img_array = np.array(img)
+                    if len(img_array.shape) == 3 and img_array.shape[2] == 4: # RGBA
+                        img_array = img_array[:, :, :3] # Convert to RGB
+
+                    self.tensorboard_writer.add_image(
+                        f'Validation/Detailed_Sample_Epoch_{epoch+1}',
+                        img_array,
+                        epoch,
+                        dataformats='HWC'
+                    )
+                    print(f"   📈 Detailed validation sample logged to TensorBoard.")
+                except Exception as e:
+                    print(f"   ⚠️ Error adding detailed validation plot to TensorBoard: {e}")
+
+        except Exception as e:
+            print(f"   ⚠️  Error creating detailed validation plot: {e}")
+            import traceback
+            traceback.print_exc()
+
 # ==============================================================================
 # Training Functions
 # ==============================================================================
@@ -1562,6 +1703,9 @@ def run_finetuning(train_dataset: Dataset,
         val_check_interval=TRAINING_CONFIG["val_check_interval"],
     )
     
+    # Manually add our custom parameter, as it's not part of the base class
+    config.validate_every_n_epochs = TRAINING_CONFIG["validate_every_n_epochs"]
+
     # Create verbose finetuner
     finetuner = VerboseTimesFMFinetuner(model, config, logger=logger)
     

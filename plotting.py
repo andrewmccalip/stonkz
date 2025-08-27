@@ -804,48 +804,63 @@ def _plot_comprehensive_main(ax, plot_data, model_name, epoch, verbose):
     context = plot_data['context']
     prediction = plot_data['prediction']
     ground_truth = plot_data['ground_truth']
-    timestamps = plot_data['timestamps']
+    context_time = plot_data['context_timestamps']
+    pred_time = plot_data['prediction_timestamps']
     
-    # Create time axis
-    context_len = len(context)
+    # Ensure pred_len is always defined
     pred_len = len(prediction) if prediction is not None else 0
-    
-    if timestamps is not None:
-        context_time = timestamps[:context_len]
-        if prediction is not None:
-            pred_time = timestamps[context_len:context_len + pred_len]
-        else:
-            pred_time = []
-    else:
-        context_time = np.arange(context_len)
-        pred_time = np.arange(context_len, context_len + pred_len)
-    
-    # Plot context (historical data) - larger, more prominent
+
+    # Plot context (historical data) - using same style as plot_prediction_results
     ax.plot(context_time, context, color=COLORS['historical'], 
-            linewidth=3, label='Historical Context', alpha=0.9)
+            linewidth=DEFAULT_STYLE['line_width'], label='Historical Data', 
+            alpha=DEFAULT_STYLE['line_alpha'])
+    
+    # Add reference line for normalized data
+    if plot_data.get('normalized', True):
+        ax.axhline(y=1.0, color=COLORS['reference'], linestyle=':', 
+                  alpha=0.5, linewidth=1, label='Normalized Start (1.00)')
     
     # Plot predictions and ground truth if available
     if prediction is not None:
         ax.plot(pred_time, prediction, color=COLORS['prediction'], 
-                linewidth=3, label=f'{model_name} Prediction', alpha=0.9)
+                linewidth=DEFAULT_STYLE['line_width'], 
+                label=f'{model_name} Fine-tuned Prediction', 
+                alpha=DEFAULT_STYLE['line_alpha'])
+        
+        # Connect context to prediction with thin line
+        if len(context) > 0 and len(pred_time) > 0:
+            last_context_time = context_time[-1]
+            last_context_price = context[-1]
+            first_pred_time = pred_time[0]
+            first_pred_price = prediction[0]
+            
+            ax.plot([last_context_time, first_pred_time], 
+                   [last_context_price, first_pred_price],
+                   color=COLORS['prediction'], linewidth=1, alpha=0.3)
         
         if ground_truth is not None:
             ax.plot(pred_time, ground_truth, color=COLORS['ground_truth'], 
-                    linewidth=3, label='Ground Truth', alpha=0.9)
+                    linewidth=DEFAULT_STYLE['line_width'], label='Ground Truth', 
+                    alpha=DEFAULT_STYLE['line_alpha'])
     
     # Add vertical line to separate context from prediction
     if pred_len > 0:
-        ax.axvline(x=context_time[-1] if timestamps is not None else context_len, 
+        ax.axvline(x=context_time[-1] if len(context_time) > 0 else context_len, 
                    color=COLORS['current_time'], linestyle='--', linewidth=2, 
-                   alpha=0.7, label='Prediction Start')
+                   alpha=0.6, label='Prediction Start')
     
-    # Formatting
-    ax.set_title(f'Prediction Comparison - Epoch {epoch}', 
-                fontsize=14, fontweight='bold', pad=20)
-    ax.set_xlabel('Time', fontsize=12)
-    ax.set_ylabel('Normalized Price', fontsize=12)
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper left', fontsize=11)
+    # Calculate and add metrics box (like in the original plot_prediction_results)
+    if prediction is not None and ground_truth is not None:
+        metrics = _calculate_metrics(prediction, ground_truth)
+        _add_metrics_text(ax, metrics, model_name)
+    
+    # Formatting - using same style as plot_prediction_results
+    ax.set_title(f'Test {model_name} Fine-tuning - Epoch {epoch + 1}', 
+                fontsize=DEFAULT_STYLE['title_fontsize'], fontweight='bold')
+    ax.set_xlabel('Time', fontsize=DEFAULT_STYLE['label_fontsize'])
+    ax.set_ylabel('Normalized Price', fontsize=DEFAULT_STYLE['label_fontsize'])
+    ax.grid(True, alpha=DEFAULT_STYLE['grid_alpha'])
+    ax.legend(loc='upper left', fontsize=DEFAULT_STYLE['legend_fontsize'])
     
     # Set y-axis to focus on the data range
     if prediction is not None and ground_truth is not None:
