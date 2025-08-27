@@ -116,7 +116,7 @@ TRAINING_CONFIG = {
 # Sample configuration (for testing)
 SAMPLE_CONFIG = {
     "use_sample": True,      # Use random sample instead of full dataset
-    "total_sequences": 1000, # Total sequences to use
+    "total_sequences": 5000, # Total sequences to use
     "train_ratio": 0.7,      # 70% for training
     "val_ratio": 0.2,        # 20% for validation  
     "test_ratio": 0.1,       # 10% for testing
@@ -647,14 +647,27 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                 all_predictions = torch.cat(val_predictions, dim=0)
                 all_targets = torch.cat(val_targets, dim=0)
                 
-                # Calculate metrics
+                # Calculate metrics - ensure tensors have matching shapes
+                # Flatten if needed to handle shape mismatches
+                if all_predictions.shape != all_targets.shape:
+                    print(f"   🔧 Shape mismatch detected: pred {all_predictions.shape} vs target {all_targets.shape}")
+                    # Take minimum dimensions to align shapes
+                    min_batch = min(all_predictions.shape[0], all_targets.shape[0])
+                    min_seq = min(all_predictions.shape[1], all_targets.shape[1])
+                    all_predictions = all_predictions[:min_batch, :min_seq]
+                    all_targets = all_targets[:min_batch, :min_seq]
+                    print(f"   🔧 Aligned shapes to: {all_predictions.shape}")
+                
                 mse = torch.mean((all_predictions - all_targets) ** 2).item()
                 mae = torch.mean(torch.abs(all_predictions - all_targets)).item()
                 
-                # Directional accuracy
-                pred_direction = (all_predictions[:, 1:] > all_predictions[:, :-1]).float()
-                true_direction = (all_targets[:, 1:] > all_targets[:, :-1]).float()
-                dir_accuracy = (pred_direction == true_direction).float().mean().item()
+                # Directional accuracy - ensure we have enough timesteps
+                if all_predictions.shape[1] > 1:
+                    pred_direction = (all_predictions[:, 1:] > all_predictions[:, :-1]).float()
+                    true_direction = (all_targets[:, 1:] > all_targets[:, :-1]).float()
+                    dir_accuracy = (pred_direction == true_direction).float().mean().item()
+                else:
+                    dir_accuracy = 0.5  # Default to 50% if only one timestep
                 
                 # Correlation
                 correlations = []
@@ -914,7 +927,7 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
             print("   ⚠️ Plotting module not available, skipping comprehensive plot")
             return None
             
-        if self.latest_sample_data['context'] is None:
+        if not hasattr(self, 'latest_sample_data') or self.latest_sample_data is None or self.latest_sample_data.get('context') is None:
             print("   ⚠️ No sample data available for plotting")
             return None
         
@@ -945,8 +958,9 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             save_path = FINETUNE_PLOTS_DIR / f"comprehensive_epoch_{epoch+1:03d}_{timestamp}.png"
             
-            # Create the plot using plotting.py
-            result = plot_prediction_results(
+            # Create the comprehensive dashboard using plotting.py
+            from plotting import plot_comprehensive_dashboard
+            result = plot_comprehensive_dashboard(
                 context_data=context_data,
                 prediction_data=prediction_data,
                 ground_truth_data=ground_truth_data,
@@ -955,7 +969,8 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                 save_path=save_path,
                 show_plot=False,
                 normalize_to_start=True,
-                add_metrics=True,
+                epoch=epoch,
+                training_history=self.training_history,
                 verbose=False
             )
             
@@ -972,6 +987,10 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                         img = Image.open(result['plot_path'])
                         img_array = np.array(img)
                         
+                        # Ensure image is in correct format for TensorBoard
+                        if len(img_array.shape) == 3 and img_array.shape[2] == 4:  # RGBA
+                            img_array = img_array[:, :, :3]  # Convert to RGB
+                        
                         self.tensorboard_writer.add_image(
                             'Comprehensive_Plots/Epoch_Summary',
                             img_array,
@@ -979,10 +998,20 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                             dataformats='HWC'
                         )
                         
-                        print(f"   📊 Comprehensive plot added to TensorBoard")
+                        # Also add with a unique tag for each epoch
+                        self.tensorboard_writer.add_image(
+                            f'Comprehensive_Plots/Epoch_{epoch+1:03d}',
+                            img_array,
+                            epoch,
+                            dataformats='HWC'
+                        )
+                        
+                        print(f"   📊 Comprehensive plot added to TensorBoard (2 views)")
                         
                     except Exception as e:
                         print(f"   ⚠️ Error adding comprehensive plot to TensorBoard: {e}")
+                        import traceback
+                        print(f"   🔍 Traceback: {traceback.format_exc()}")
                 
                 return result['plot_path']
             else:
@@ -1125,7 +1154,7 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         ax3.set_ylabel('Prediction MSE')
         ax3.set_title('Model Comparison: Official TimesFM vs Fine-tuned', fontweight='bold')
         ax3.legend()
-            ax3.grid(True, alpha=0.3)
+        ax3.grid(True, alpha=0.3)
         ax3.set_ylim(0.0005, 0.0015)
         
         # Plot 4: Recent Volatility & Range Matching (Middle Left)
@@ -1146,7 +1175,7 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         ax4.set_ylabel('Ratio magnitude')
         ax4.set_title('Recent Volatility & Range Matching (last 1000 iterations)', fontweight='bold')
         ax4.legend()
-            ax4.grid(True, alpha=0.3)
+        ax4.grid(True, alpha=0.3)
         ax4.set_ylim(0, 2.0)
         
         # Plot 5: Sample Prediction vs Target (Middle Center)
@@ -1406,11 +1435,14 @@ Degradation: +-8.0%"""
                 if (epoch + 1) % 2 == 0 or epoch == self.config.num_epochs - 1:
                     self.plot_training_progress()
                 
-                # Create comprehensive prediction plots every 5 epochs
-                if (epoch + 1) % 5 == 0 or epoch == self.config.num_epochs - 1:
+                # Create comprehensive prediction plots every 2 epochs (more frequent)
+                if (epoch + 1) % 2 == 0 or epoch == self.config.num_epochs - 1:
                     comprehensive_plot_path = self.create_comprehensive_prediction_plot(epoch)
                     if comprehensive_plot_path:
                         print(f"   📊 Comprehensive prediction plot created for epoch {epoch + 1}")
+                        print(f"   📊 Plot saved to: {comprehensive_plot_path}")
+                    else:
+                        print(f"   ⚠️ Failed to create comprehensive plot for epoch {epoch + 1}")
                 
                 # Create training evolution plots every 10 epochs
                 if (epoch + 1) % 10 == 0 or epoch == self.config.num_epochs - 1:
