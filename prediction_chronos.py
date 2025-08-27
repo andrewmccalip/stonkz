@@ -46,7 +46,12 @@ from plotting import plot_prediction_results
 MODEL_NAME = "amazon/chronos-t5-large"
 CONTEXT_LENGTH = 416    # Historical context in minutes (~6.9 hours)
 HORIZON_LENGTH = 64     # Prediction horizon in minutes (~1.6 hours)
-NUM_SAMPLES = 1       # Number of forecast samples for probabilistic prediction
+NUM_SAMPLES = 100     # Number of forecast samples for probabilistic prediction (increased for better quality)
+
+# Inference Configuration
+TEMPERATURE = 1.0     # Sampling temperature (1.0 = default, higher = more diverse)
+TOP_K = 50           # Top-k sampling
+TOP_P = 1.0          # Nucleus sampling
 
 # Device Configuration
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -157,22 +162,24 @@ def _validate_input_data(data, context_length=CONTEXT_LENGTH):
             raise RuntimeError(f"{ERROR_CODES['CHRONOS_002']}: {str(e)}")
 
 def _prepare_model_input(data, verbose=False):
-    """Prepare data for Chronos model input."""
+    """Prepare data for Chronos model input - data is already normalized."""
     try:
         # Validate input data
         validated_data = _validate_input_data(data)
         
-        # Convert to torch tensor
+        # Data is already normalized to start at 1.0, so no additional scaling needed
+        # Convert directly to torch tensor
         context_tensor = torch.tensor(validated_data, dtype=torch.float32)
         
         if verbose:
             print(f"🔍 Validating input data...")
             print(f"✅ Data validated: {len(validated_data)} points, range [{validated_data.min():.6f}, {validated_data.max():.6f}]")
             print(f"📊 Preparing data for Chronos...")
+            print(f"   Using pre-normalized data (no additional scaling)")
             print(f"   Context tensor shape: {context_tensor.shape}")
             print(f"   Context tensor dtype: {context_tensor.dtype}")
         
-        return context_tensor
+        return context_tensor  # No scaling factor needed
         
     except Exception as e:
         if "CHRONOS_" in str(e):
@@ -214,7 +221,7 @@ def predict_chronos(close_data, context_length=CONTEXT_LENGTH, horizon_length=HO
         print(f"   Number of samples: {num_samples}")
     
     try:
-        # Prepare input data
+        # Prepare input data (already normalized)
         context_tensor = _prepare_model_input(close_data, verbose=verbose)
         
         # Load model
@@ -228,12 +235,15 @@ def predict_chronos(close_data, context_length=CONTEXT_LENGTH, horizon_length=HO
             print(f"   Context range: [{context_tensor.min():.6f}, {context_tensor.max():.6f}]")
             print(f"   Context end value: {context_tensor[-1]:.6f}")
         
-        # Perform inference
+        # Perform inference with improved parameters
         with torch.no_grad():
             forecast = model.predict(
                 context=context_tensor, 
                 prediction_length=horizon_length,
-                num_samples=num_samples
+                num_samples=num_samples,
+                temperature=TEMPERATURE,
+                top_k=TOP_K,
+                top_p=TOP_P
             )
         
         # Process output
@@ -241,7 +251,8 @@ def predict_chronos(close_data, context_length=CONTEXT_LENGTH, horizon_length=HO
         # Since we have 1 series: [1, num_samples, prediction_length]
         forecast_samples = forecast[0].numpy()  # Shape: [num_samples, prediction_length]
         
-        # Calculate statistics
+        # No scaling needed - data is already in correct normalized format
+        # Calculate statistics directly on predictions
         median_forecast = np.median(forecast_samples, axis=0)  # Shape: [prediction_length]
         low_quantile = np.quantile(forecast_samples, 0.1, axis=0)   # 10th percentile
         high_quantile = np.quantile(forecast_samples, 0.9, axis=0)  # 90th percentile
@@ -252,7 +263,9 @@ def predict_chronos(close_data, context_length=CONTEXT_LENGTH, horizon_length=HO
             print(f"   First 5: {median_forecast[:5]}")
             print(f"   Last 5: {median_forecast[-5:]}")
             print(f"   Prediction start: {median_forecast[0]:.6f}")
-            print(f"   Continuity gap: {median_forecast[0] - context_tensor[-1].item():.6f}")
+            # Calculate continuity gap (no scaling needed)
+            context_end = close_data[-1] if hasattr(close_data, '__getitem__') else context_tensor[-1].item()
+            print(f"   Continuity gap: {median_forecast[0] - context_end:.6f}")
         
         # Prepare return data
         result = {
@@ -272,8 +285,8 @@ def predict_chronos(close_data, context_length=CONTEXT_LENGTH, horizon_length=HO
                 'parameters': '710M',
                 'prediction_start': median_forecast[0],
                 'prediction_end': median_forecast[-1],
-                'context_end': context_tensor[-1].item(),
-                'continuity_gap': median_forecast[0] - context_tensor[-1].item()
+                'context_end': close_data[-1] if hasattr(close_data, '__getitem__') else context_tensor[-1].item(),
+                'continuity_gap': median_forecast[0] - (close_data[-1] if hasattr(close_data, '__getitem__') else context_tensor[-1].item())
             }
         }
         
@@ -405,16 +418,23 @@ def _test_with_random_csv():
         print(f"\n🎨 Creating visualization plot...")
         try:
             # Prepare data for plotting
+            # Create save path for the plot
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_path = PLOTS_DIR / f"chronos-t5-large_prediction_{timestamp}.png"
+            
+            # Prepare ground truth data (extract close prices if available)
+            ground_truth_close = None
+            if len(actual_future) > 0:
+                ground_truth_close = actual_future['close'].values
+            
             plot_result = plot_prediction_results(
-                context_data=historical_data,
+                context_data=historical_data['close'].values,  # Extract close prices for context
                 prediction_data=predictions,
-                ground_truth_data=actual_future if len(actual_future) > 0 else None,
+                ground_truth_data=ground_truth_close,
                 title=f"Chronos-T5-Large Prediction - {random_file.stem}",
                 model_name="Chronos-T5-Large",
-                output_dir=str(PLOTS_DIR),
-                show_plot=False,
-                add_metrics=True,
-                verbose=True
+                save_path=str(save_path),
+                show_plot=False
             )
             
             if plot_result and 'plot_path' in plot_result:
