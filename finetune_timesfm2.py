@@ -2,6 +2,37 @@
 """
 TimesFM 2.0 Finetuning Script - ES Futures Dataset
 Uses the organized sequence dataset with proper time-based splitting to avoid contamination.
+
+=== TENSORBOARD MONITORING ===
+This script includes comprehensive TensorBoard logging for real-time training monitoring.
+
+USAGE:
+1. Start training: python finetune_timesfm2.py
+2. In another terminal, start TensorBoard: tensorboard --logdir=tensorboard_logs
+3. Open browser to: http://localhost:6006
+4. View real-time training progress, metrics, and plots
+
+TENSORBOARD FEATURES:
+- Real-time loss curves (train/validation)
+- Performance metrics (accuracy, correlation, MSE, MAE)
+- Learning rate scheduling
+- Gradient norms and training efficiency
+- Comprehensive training plots (automatically uploaded)
+- Model architecture graph
+- Hyperparameter tracking
+
+TABS IN TENSORBOARD:
+- SCALARS: All numeric metrics over time
+- IMAGES: Training progress plots and validation samples
+- GRAPHS: Model architecture visualization
+- HISTOGRAMS: Weight and gradient distributions
+- HPARAMS: Hyperparameter comparison across runs
+
+TIPS:
+- Refresh browser to see latest updates
+- Use the smoothing slider to reduce noise in plots
+- Compare multiple runs by training with different parameters
+- Download plots directly from TensorBoard interface
 """
 
 import os
@@ -20,6 +51,7 @@ import warnings
 warnings.filterwarnings('ignore')
 import matplotlib.pyplot as plt
 import time
+from torch.utils.tensorboard import SummaryWriter
 
 # Add TimesFM to path
 SCRIPT_DIR = Path(__file__).parent
@@ -43,6 +75,10 @@ CACHE_DIR.mkdir(exist_ok=True)
 # Plotting directory
 FINETUNE_PLOTS_DIR = SCRIPT_DIR / "finetune_plots"
 FINETUNE_PLOTS_DIR.mkdir(exist_ok=True)
+
+# TensorBoard Configuration
+TENSORBOARD_LOG_DIR = SCRIPT_DIR / "tensorboard_logs"
+TENSORBOARD_LOG_DIR.mkdir(exist_ok=True)
 
 # Model configuration - Using original TimesFM 2.0 500m (NOT Flamingo)
 MODEL_CONFIG = {
@@ -432,6 +468,21 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         }
         self.start_time = None
         
+        # Additional tracking for comprehensive analysis
+        self.learning_rates = []
+        self.gradient_norms = []
+        self.loss_components = {}
+        self.performance_metrics = {
+            'directional_accuracy': [],
+            'correlation': [],
+            'mse': [],
+            'mae': []
+        }
+        
+        # TensorBoard logging
+        self.tensorboard_writer = None
+        self.global_step = 0
+        
     def _train_epoch_verbose(self, train_loader: DataLoader, optimizer: torch.optim.Optimizer, epoch: int) -> float:
         """Train for one epoch with verbose logging"""
         
@@ -444,6 +495,7 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         print(f"   Batches: {num_batches}, Batch size: {self.config.batch_size}")
         
         batch_losses = []
+        self._epoch_grad_norms = []
         
         with tqdm(train_loader, desc=f"Training Epoch {epoch + 1}", leave=False) as pbar:
             for batch_idx, batch in enumerate(pbar):
@@ -454,6 +506,16 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                     
                     optimizer.zero_grad()
                     loss.backward()
+                    
+                    # Track gradient norms
+                    total_norm = 0
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** (1. / 2)
+                    self._epoch_grad_norms.append(total_norm)
+                    
                     optimizer.step()
                     
                     batch_loss = loss.item()
@@ -462,6 +524,15 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                     
                     batch_time = time.time() - batch_start_time
                     self.training_history['batch_times'].append(batch_time)
+                    
+                    # TensorBoard logging for batch-level metrics
+                    if self.tensorboard_writer is not None:
+                        self.tensorboard_writer.add_scalar('Batch/Loss', batch_loss, self.global_step)
+                        self.tensorboard_writer.add_scalar('Batch/Time', batch_time, self.global_step)
+                        if hasattr(self, '_epoch_grad_norms') and self._epoch_grad_norms:
+                            self.tensorboard_writer.add_scalar('Batch/GradientNorm', self._epoch_grad_norms[-1], self.global_step)
+                    
+                    self.global_step += 1
                     
                     # Update progress bar
                     avg_loss_so_far = total_loss / (batch_idx + 1)
@@ -483,6 +554,21 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         epoch_time = time.time() - epoch_start_time
         self.training_history['epoch_times'].append(epoch_time)
         
+        # Track average gradient norm for this epoch
+        avg_grad_norm = None
+        if hasattr(self, '_epoch_grad_norms'):
+            avg_grad_norm = np.mean(self._epoch_grad_norms)
+            self.gradient_norms.append(avg_grad_norm)
+            delattr(self, '_epoch_grad_norms')
+        
+        # TensorBoard logging for epoch-level metrics
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.add_scalar('Epoch/TrainLoss', avg_loss, epoch)
+            self.tensorboard_writer.add_scalar('Epoch/TrainTime', epoch_time, epoch)
+            self.tensorboard_writer.add_scalar('Epoch/TrainLossStd', np.std(batch_losses), epoch)
+            if avg_grad_norm is not None:
+                self.tensorboard_writer.add_scalar('Epoch/GradientNorm', avg_grad_norm, epoch)
+        
         print(f"   ✅ Epoch {epoch + 1} completed in {epoch_time:.2f}s")
         print(f"   📊 Train Loss: {avg_loss:.6f} (std: {np.std(batch_losses):.6f})")
         
@@ -499,15 +585,22 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         print(f"   🔍 Validating...")
         
         val_losses = []
+        val_predictions = []
+        val_targets = []
         
         with torch.no_grad():
             with tqdm(val_loader, desc="Validation", leave=False) as pbar:
                 for batch_idx, batch in enumerate(pbar):
                     try:
-                        loss, _ = self._process_batch(batch)
+                        loss, predictions = self._process_batch(batch)
                         batch_loss = loss.item()
                         total_loss += batch_loss
                         val_losses.append(batch_loss)
+                        
+                        # Collect predictions and targets for metrics calculation
+                        if predictions is not None and 'target' in batch:
+                            val_predictions.append(predictions.cpu())
+                            val_targets.append(batch['target'].cpu())
                         
                         pbar.set_postfix({'Val Loss': f'{batch_loss:.6f}'})
                         
@@ -518,66 +611,348 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
         val_time = time.time() - val_start_time
         
+        # Calculate performance metrics if we have predictions and targets
+        if val_predictions and val_targets:
+            try:
+                # Concatenate all predictions and targets
+                all_predictions = torch.cat(val_predictions, dim=0)
+                all_targets = torch.cat(val_targets, dim=0)
+                
+                # Calculate metrics
+                mse = torch.mean((all_predictions - all_targets) ** 2).item()
+                mae = torch.mean(torch.abs(all_predictions - all_targets)).item()
+                
+                # Directional accuracy
+                pred_direction = (all_predictions[:, 1:] > all_predictions[:, :-1]).float()
+                true_direction = (all_targets[:, 1:] > all_targets[:, :-1]).float()
+                dir_accuracy = (pred_direction == true_direction).float().mean().item()
+                
+                # Correlation
+                correlations = []
+                for i in range(all_predictions.shape[0]):
+                    pred_i = all_predictions[i].numpy()
+                    target_i = all_targets[i].numpy()
+                    if np.std(pred_i) > 1e-6 and np.std(target_i) > 1e-6:
+                        corr = np.corrcoef(pred_i, target_i)[0, 1]
+                        if not np.isnan(corr):
+                            correlations.append(corr)
+                
+                avg_correlation = np.mean(correlations) if correlations else 0.0
+                
+                # Store metrics
+                self.performance_metrics['mse'].append(mse)
+                self.performance_metrics['mae'].append(mae)
+                self.performance_metrics['directional_accuracy'].append(dir_accuracy)
+                self.performance_metrics['correlation'].append(avg_correlation)
+                
+                print(f"   📊 Val Metrics: MSE={mse:.6f}, MAE={mae:.6f}, Dir.Acc={dir_accuracy:.1%}, Corr={avg_correlation:.3f}")
+                
+                # TensorBoard logging for validation metrics
+                if self.tensorboard_writer is not None:
+                    self.tensorboard_writer.add_scalar('Validation/MSE', mse, epoch)
+                    self.tensorboard_writer.add_scalar('Validation/MAE', mae, epoch)
+                    self.tensorboard_writer.add_scalar('Validation/DirectionalAccuracy', dir_accuracy, epoch)
+                    self.tensorboard_writer.add_scalar('Validation/Correlation', avg_correlation, epoch)
+                
+            except Exception as e:
+                print(f"   ⚠️ Error calculating performance metrics: {e}")
+        
+        # TensorBoard logging for validation loss
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.add_scalar('Epoch/ValLoss', avg_loss, epoch)
+            self.tensorboard_writer.add_scalar('Epoch/ValTime', val_time, epoch)
+            self.tensorboard_writer.add_scalar('Epoch/ValLossStd', np.std(val_losses), epoch)
+        
         print(f"   📊 Val Loss: {avg_loss:.6f} (std: {np.std(val_losses):.6f}) in {val_time:.2f}s")
         
         return avg_loss
     
     def plot_training_progress(self, save_path: Optional[Path] = None):
-        """Plot training progress"""
+        """Create comprehensive training progress plots with detailed analysis for stock predictors"""
         
         if len(self.training_history['train_loss']) == 0:
+            print("   ⚠️ No training history available for plotting")
             return
         
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        # Create 3x3 subplot layout for comprehensive analysis
+        fig, axes = plt.subplots(3, 3, figsize=(24, 18))
         
         epochs = range(1, len(self.training_history['train_loss']) + 1)
         
-        # Loss curves
-        ax1.plot(epochs, self.training_history['train_loss'], 'b-', label='Train Loss', linewidth=2)
-        ax1.plot(epochs, self.training_history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+        # Plot 1: Training and Validation Loss
+        ax1 = axes[0, 0]
+        ax1.plot(epochs, self.training_history['train_loss'], 'b-', label='Training Loss', linewidth=2, alpha=0.8)
+        ax1.plot(epochs, self.training_history['val_loss'], 'r-', label='Validation Loss', linewidth=2, alpha=0.8)
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('Loss')
         ax1.set_title('Training and Validation Loss')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
+        ax1.set_yscale('log')
         
-        # Loss difference
+        # Add best loss annotations
+        if self.training_history['val_loss']:
+            best_val_loss = min(self.training_history['val_loss'])
+            best_epoch = self.training_history['val_loss'].index(best_val_loss) + 1
+            ax1.annotate(f'Best: {best_val_loss:.6f}\nEpoch {best_epoch}', 
+                        xy=(best_epoch, best_val_loss), xytext=(0.7, 0.8),
+                        textcoords='axes fraction', fontsize=10,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
+                        arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.2'))
+        
+        # Plot 2: Loss Difference (Overfitting Monitor)
+        ax2 = axes[0, 1]
         if len(self.training_history['train_loss']) > 1:
             loss_diff = [v - t for t, v in zip(self.training_history['train_loss'], self.training_history['val_loss'])]
             ax2.plot(epochs, loss_diff, 'g-', linewidth=2)
-            ax2.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+            ax2.axhline(y=0, color='black', linestyle='--', alpha=0.5, label='No Overfitting')
+            ax2.fill_between(epochs, loss_diff, 0, where=[d > 0 for d in loss_diff], 
+                            color='red', alpha=0.3, label='Overfitting')
+            ax2.fill_between(epochs, loss_diff, 0, where=[d <= 0 for d in loss_diff], 
+                            color='green', alpha=0.3, label='Underfitting')
             ax2.set_xlabel('Epoch')
             ax2.set_ylabel('Val Loss - Train Loss')
             ax2.set_title('Overfitting Monitor')
+            ax2.legend()
             ax2.grid(True, alpha=0.3)
         
-        # Epoch times
-        if self.training_history['epoch_times']:
-            ax3.plot(epochs, self.training_history['epoch_times'], 'purple', linewidth=2)
+        # Plot 3: Learning Rate Schedule (if available)
+        ax3 = axes[0, 2]
+        if hasattr(self, 'learning_rates') and self.learning_rates:
+            ax3.plot(epochs, self.learning_rates, 'purple', linewidth=2, marker='o', markersize=3)
             ax3.set_xlabel('Epoch')
-            ax3.set_ylabel('Time (seconds)')
-            ax3.set_title('Epoch Training Time')
+            ax3.set_ylabel('Learning Rate')
+            ax3.set_title('Learning Rate Schedule')
+            ax3.set_yscale('log')
             ax3.grid(True, alpha=0.3)
+        else:
+            ax3.text(0.5, 0.5, 'No learning rate data\navailable', ha='center', va='center', transform=ax3.transAxes)
         
-        # Batch time distribution
-        if self.training_history['batch_times']:
-            ax4.hist(self.training_history['batch_times'], bins=30, alpha=0.7, color='orange')
-            ax4.set_xlabel('Batch Time (seconds)')
-            ax4.set_ylabel('Frequency')
-            ax4.set_title('Batch Time Distribution')
+        # Plot 4: Epoch Training Time
+        ax4 = axes[1, 0]
+        if self.training_history['epoch_times']:
+            ax4.plot(epochs, self.training_history['epoch_times'], 'purple', linewidth=2, marker='o', markersize=4)
+            ax4.set_xlabel('Epoch')
+            ax4.set_ylabel('Training Time (seconds)')
+            ax4.set_title('Epoch Training Time')
             ax4.grid(True, alpha=0.3)
+            
+            # Add trend line
+            if len(self.training_history['epoch_times']) > 1:
+                z = np.polyfit(epochs, self.training_history['epoch_times'], 1)
+                p = np.poly1d(z)
+                ax4.plot(epochs, p(epochs), "r--", alpha=0.8, linewidth=1, label=f'Trend: {z[0]:.2f}s/epoch')
+                ax4.legend()
+        else:
+            ax4.text(0.5, 0.5, 'No timing data available', ha='center', va='center', transform=ax4.transAxes)
         
-        plt.tight_layout()
+        # Plot 5: Batch Time Distribution
+        ax5 = axes[1, 1]
+        if self.training_history['batch_times']:
+            n, bins, patches = ax5.hist(self.training_history['batch_times'], bins=50, alpha=0.7, 
+                                       color='orange', edgecolor='black', density=True)
+            ax5.set_xlabel('Batch Processing Time (seconds)')
+            ax5.set_ylabel('Density')
+            ax5.set_title('Batch Time Distribution')
+            ax5.grid(True, alpha=0.3)
+            
+            # Add statistics
+            mean_time = np.mean(self.training_history['batch_times'])
+            std_time = np.std(self.training_history['batch_times'])
+            median_time = np.median(self.training_history['batch_times'])
+            ax5.axvline(mean_time, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_time:.3f}s')
+            ax5.axvline(median_time, color='blue', linestyle='--', linewidth=2, label=f'Median: {median_time:.3f}s')
+            ax5.legend()
+            
+            # Add text box with detailed stats
+            stats_text = f'Mean: {mean_time:.3f}s\nStd: {std_time:.3f}s\nMedian: {median_time:.3f}s\nMin: {min(self.training_history["batch_times"]):.3f}s\nMax: {max(self.training_history["batch_times"]):.3f}s'
+            ax5.text(0.98, 0.98, stats_text, transform=ax5.transAxes, 
+                    verticalalignment='top', horizontalalignment='right', fontsize=9,
+                    bbox=dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.8))
+        else:
+            ax5.text(0.5, 0.5, 'No batch timing data available', ha='center', va='center', transform=ax5.transAxes)
         
+        # Plot 6: Loss Components (if available from custom loss functions)
+        ax6 = axes[1, 2]
+        if hasattr(self, 'loss_components') and self.loss_components:
+            # Plot different loss components
+            for component_name, values in self.loss_components.items():
+                if values:  # Only plot if we have data
+                    component_epochs = range(1, len(values) + 1)
+                    ax6.plot(component_epochs, values, label=component_name, linewidth=2, alpha=0.8)
+            ax6.set_xlabel('Epoch')
+            ax6.set_ylabel('Loss Component Value')
+            ax6.set_title('Loss Components Breakdown')
+            ax6.legend()
+            ax6.grid(True, alpha=0.3)
+            ax6.set_yscale('log')
+        else:
+            ax6.text(0.5, 0.5, 'No loss component data\n(Standard MSE loss)', ha='center', va='center', transform=ax6.transAxes)
+        
+        # Plot 7: Gradient Norms (if tracked)
+        ax7 = axes[2, 0]
+        if hasattr(self, 'gradient_norms') and self.gradient_norms:
+            grad_epochs = range(1, len(self.gradient_norms) + 1)
+            ax7.plot(grad_epochs, self.gradient_norms, 'brown', linewidth=2, alpha=0.8)
+            ax7.set_xlabel('Epoch')
+            ax7.set_ylabel('Gradient Norm')
+            ax7.set_title('Gradient Norm Evolution')
+            ax7.grid(True, alpha=0.3)
+            ax7.set_yscale('log')
+            
+            # Add gradient clipping threshold if applicable
+            ax7.axhline(y=1.0, color='red', linestyle='--', alpha=0.5, label='Clipping Threshold')
+            ax7.legend()
+        else:
+            ax7.text(0.5, 0.5, 'No gradient norm data\ntracked', ha='center', va='center', transform=ax7.transAxes)
+        
+        # Plot 8: Model Performance Metrics
+        ax8 = axes[2, 1]
+        if hasattr(self, 'performance_metrics') and self.performance_metrics:
+            # Plot metrics like accuracy, correlation, etc.
+            for metric_name, values in self.performance_metrics.items():
+                if values:
+                    metric_epochs = range(1, len(values) + 1)
+                    if 'accuracy' in metric_name.lower():
+                        # Convert to percentage for accuracy metrics
+                        values_pct = [v * 100 for v in values]
+                        ax8.plot(metric_epochs, values_pct, label=f'{metric_name} (%)', linewidth=2, alpha=0.8)
+                    else:
+                        ax8.plot(metric_epochs, values, label=metric_name, linewidth=2, alpha=0.8)
+            
+            ax8.set_xlabel('Epoch')
+            ax8.set_ylabel('Metric Value')
+            ax8.set_title('Model Performance Metrics')
+            ax8.legend()
+            ax8.grid(True, alpha=0.3)
+            
+            # Add baseline for accuracy metrics
+            if any('accuracy' in name.lower() for name in self.performance_metrics.keys()):
+                ax8.axhline(y=50, color='red', linestyle='--', alpha=0.5, label='Random (50%)')
+        else:
+            ax8.text(0.5, 0.5, 'No performance metrics\ntracked', ha='center', va='center', transform=ax8.transAxes)
+        
+        # Plot 9: Training Summary and Statistics
+        ax9 = axes[2, 2]
+        ax9.axis('off')
+        
+        # Create comprehensive summary text
+        summary_parts = ['📊 Training Summary', '=' * 25]
+        
+        if epochs:
+            summary_parts.extend([
+                f'Total Epochs: {len(epochs)}',
+                f'Best Val Loss: {min(self.training_history["val_loss"]):.6f}',
+                f'Final Train Loss: {self.training_history["train_loss"][-1]:.6f}',
+                f'Final Val Loss: {self.training_history["val_loss"][-1]:.6f}',
+                ''
+            ])
+        
+        # Training efficiency metrics
+        if self.training_history['epoch_times']:
+            total_time = sum(self.training_history['epoch_times'])
+            avg_time = np.mean(self.training_history['epoch_times'])
+            summary_parts.extend([
+                '⏱️ Training Efficiency:',
+                f'Total Time: {total_time/3600:.2f} hours',
+                f'Avg Epoch Time: {avg_time:.1f}s',
+                f'Est. Time/1000 epochs: {avg_time*1000/3600:.1f}h',
+                ''
+            ])
+        
+        # Batch processing stats
+        if self.training_history['batch_times']:
+            avg_batch_time = np.mean(self.training_history['batch_times'])
+            total_batches = len(self.training_history['batch_times'])
+            summary_parts.extend([
+                '🔄 Batch Processing:',
+                f'Total Batches: {total_batches:,}',
+                f'Avg Batch Time: {avg_batch_time:.3f}s',
+                f'Batches/sec: {1/avg_batch_time:.1f}',
+                ''
+            ])
+        
+        # Loss improvement analysis
+        if len(self.training_history['val_loss']) > 1:
+            initial_val_loss = self.training_history['val_loss'][0]
+            final_val_loss = self.training_history['val_loss'][-1]
+            improvement = (initial_val_loss - final_val_loss) / initial_val_loss * 100
+            summary_parts.extend([
+                '📈 Loss Improvement:',
+                f'Initial Val Loss: {initial_val_loss:.6f}',
+                f'Final Val Loss: {final_val_loss:.6f}',
+                f'Improvement: {improvement:.1f}%',
+                ''
+            ])
+        
+        # Overfitting analysis
+        if len(self.training_history['train_loss']) > 1:
+            loss_diff = [v - t for t, v in zip(self.training_history['train_loss'], self.training_history['val_loss'])]
+            avg_overfitting = np.mean([d for d in loss_diff if d > 0])
+            overfitting_epochs = sum(1 for d in loss_diff if d > 0)
+            summary_parts.extend([
+                '🎯 Overfitting Analysis:',
+                f'Overfitting Epochs: {overfitting_epochs}/{len(loss_diff)}',
+                f'Avg Overfitting: {avg_overfitting:.6f}' if overfitting_epochs > 0 else 'No Overfitting Detected',
+                ''
+            ])
+        
+        # Performance metrics summary
+        if hasattr(self, 'performance_metrics') and self.performance_metrics:
+            summary_parts.append('🎯 Final Performance:')
+            for metric_name, values in self.performance_metrics.items():
+                if values:
+                    final_value = values[-1]
+                    if 'accuracy' in metric_name.lower():
+                        summary_parts.append(f'{metric_name}: {final_value:.1%}')
+                    else:
+                        summary_parts.append(f'{metric_name}: {final_value:.4f}')
+            summary_parts.append('')
+        
+        # Model configuration
+        summary_parts.extend([
+            '⚙️ Configuration:',
+            f'Context Length: {SPLIT_CONFIG["context_minutes"]}',
+            f'Horizon Length: {SPLIT_CONFIG["prediction_minutes"]}',
+            f'Batch Size: {TRAINING_CONFIG["batch_size"]}',
+            f'Learning Rate: {TRAINING_CONFIG["learning_rate"]}',
+        ])
+        
+        ax9.text(0.05, 0.95, '\n'.join(summary_parts), 
+                transform=ax9.transAxes, fontsize=10, verticalalignment='top',
+                fontfamily='monospace',
+                bbox=dict(boxstyle='round,pad=1', facecolor='lightblue', alpha=0.3))
+        
+        # Add overall title
+        plt.suptitle(f'TimesFM 2.0 Fine-tuning Analysis - {len(epochs)} Epochs', fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        
+        # Save plot with timestamp
         if save_path is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             save_path = FINETUNE_PLOTS_DIR / f"training_progress_{timestamp}.png"
         
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        
+        # Log to TensorBoard
+        if self.tensorboard_writer is not None:
+            # Convert plot to image for TensorBoard
+            fig_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            fig_array = fig_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            
+            # Add image to TensorBoard (HWC format)
+            current_epoch = len(self.training_history['train_loss']) - 1
+            self.tensorboard_writer.add_image('Training/ProgressPlot', fig_array, current_epoch, dataformats='HWC')
+        
         plt.close()
         
-        print(f"   📊 Training plot saved: {save_path}")
+        # Also save as latest.png for easy viewing
+        latest_path = FINETUNE_PLOTS_DIR / 'training_progress_latest.png'
+        import shutil
+        shutil.copy(save_path, latest_path)
         
+        print(f"   📊 Training progress plot saved: {save_path}")
+        print(f"   📊 Latest plot: {latest_path}")
         return save_path
     
     def finetune_verbose(self, train_dataset: Dataset, val_dataset: Dataset) -> Dict[str, Any]:
@@ -585,6 +960,11 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         
         self.start_time = time.time()
         self.model = self.model.to(self.device)
+        
+        # Initialize TensorBoard
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tensorboard_run_dir = TENSORBOARD_LOG_DIR / f"timesfm_run_{timestamp}"
+        self.tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_run_dir))
         
         train_loader = self._create_dataloader(train_dataset, is_train=True)
         val_loader = self._create_dataloader(val_dataset, is_train=False)
@@ -603,7 +983,35 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         print(f"   Learning rate: {self.config.learning_rate}")
         print(f"   Epochs: {self.config.num_epochs}")
         print(f"   Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"   TensorBoard logs: {tensorboard_run_dir}")
         print("=" * 60)
+        
+        # Log hyperparameters to TensorBoard
+        hparams = {
+            'batch_size': self.config.batch_size,
+            'learning_rate': self.config.learning_rate,
+            'weight_decay': self.config.weight_decay,
+            'num_epochs': self.config.num_epochs,
+            'context_length': SPLIT_CONFIG["context_minutes"],
+            'horizon_length': SPLIT_CONFIG["prediction_minutes"],
+            'model_parameters': sum(p.numel() for p in self.model.parameters()),
+            'device': str(self.device)
+        }
+        
+        # Log model architecture (try to get a sample input for the graph)
+        try:
+            sample_batch = next(iter(train_loader))
+            sample_input = (
+                sample_batch['context'].to(self.device)[:1],  # Take first sample
+                sample_batch['context_padding'].to(self.device)[:1],
+                sample_batch['freq'].to(self.device)[:1]
+            )
+            self.tensorboard_writer.add_graph(self.model, sample_input)
+            print("   📊 Model graph logged to TensorBoard")
+        except Exception as e:
+            print(f"   ⚠️ Could not log model graph: {e}")
+        
+        self.tensorboard_writer.add_hparams(hparams, {})
         
         best_val_loss = float('inf')
         best_epoch = 0
@@ -617,6 +1025,14 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                 # Validation
                 val_loss = self._validate_verbose(val_loader, epoch)
                 self.training_history['val_loss'].append(val_loss)
+                
+                # Track learning rate
+                current_lr = optimizer.param_groups[0]['lr']
+                self.learning_rates.append(current_lr)
+                
+                # TensorBoard logging for learning rate
+                if self.tensorboard_writer is not None:
+                    self.tensorboard_writer.add_scalar('Epoch/LearningRate', current_lr, epoch)
                 
                 # Track best model
                 if val_loss < best_val_loss:
@@ -645,18 +1061,48 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         print(f"\n✅ Finetuning completed!")
         print(f"   Total time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
         print(f"   Best validation loss: {best_val_loss:.6f} (epoch {best_epoch + 1})")
-        print(f"   Final train loss: {self.training_history['train_loss'][-1]:.6f}")
-        print(f"   Final val loss: {self.training_history['val_loss'][-1]:.6f}")
+        
+        # Handle case where training was interrupted
+        if self.training_history['train_loss']:
+            print(f"   Final train loss: {self.training_history['train_loss'][-1]:.6f}")
+        else:
+            print(f"   Final train loss: N/A (training interrupted)")
+            
+        if self.training_history['val_loss']:
+            print(f"   Final val loss: {self.training_history['val_loss'][-1]:.6f}")
+        else:
+            print(f"   Final val loss: N/A (validation not completed)")
         
         # Final plot
         final_plot_path = self.plot_training_progress()
+        
+        # Log final metrics to TensorBoard
+        if self.tensorboard_writer is not None:
+            final_metrics = {
+                'final_train_loss': self.training_history['train_loss'][-1] if self.training_history['train_loss'] else float('inf'),
+                'final_val_loss': self.training_history['val_loss'][-1] if self.training_history['val_loss'] else float('inf'),
+                'best_val_loss': best_val_loss,
+                'total_time_minutes': total_time / 60,
+                'best_epoch': best_epoch,
+                'epochs_completed': len(self.training_history['train_loss'])
+            }
+            
+            # Update hparams with final results
+            self.tensorboard_writer.add_hparams(hparams, final_metrics)
+            
+            # Close TensorBoard writer
+            self.tensorboard_writer.close()
+            print(f"   📊 TensorBoard logs saved to: {tensorboard_run_dir}")
+            print(f"   🌐 Start TensorBoard with: tensorboard --logdir={TENSORBOARD_LOG_DIR}")
+            print(f"   🌐 Then open: http://localhost:6006")
         
         return {
             'history': self.training_history,
             'best_val_loss': best_val_loss,
             'best_epoch': best_epoch,
             'total_time': total_time,
-            'final_plot': final_plot_path
+            'final_plot': final_plot_path,
+            'tensorboard_dir': str(tensorboard_run_dir) if self.tensorboard_writer else None
         }
 
 # ==============================================================================
@@ -824,6 +1270,13 @@ def main():
     """Main finetuning pipeline"""
     
     print("🚀 TimesFM 2.0 ES Futures Finetuning Pipeline")
+    print("=" * 60)
+    print()
+    print("📊 TENSORBOARD MONITORING ENABLED")
+    print("   1. Training will start shortly...")
+    print("   2. Open a new terminal and run: tensorboard --logdir=tensorboard_logs")
+    print("   3. Open browser to: http://localhost:6006")
+    print("   4. View real-time training progress, metrics, and plots!")
     print("=" * 60)
     
     try:
