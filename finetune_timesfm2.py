@@ -109,7 +109,7 @@ TRAINING_CONFIG = {
     "use_quantile_loss": True,
     "log_every_n_steps": 10,
     "val_check_interval": 0.5,  # Original finetuner param, not used in our verbose loop
-    "validate_every_n_epochs": 5, # Run validation every 5 epochs
+    "validate_every_n_epochs": 1, # Run validation every 5 epochs
     "use_wandb": False,      # Disabled for testing
     "wandb_project": "timesfm2-es-futures",
 }
@@ -117,7 +117,7 @@ TRAINING_CONFIG = {
 # Sample configuration (for testing)
 SAMPLE_CONFIG = {
     "use_sample": True,      # Use random sample instead of full dataset
-    "total_sequences": 1000, # Total sequences to use
+    "total_sequences": 1000000, # Total sequences to use
     "train_ratio": 0.7,      # 70% for training
     "val_ratio": 0.2,        # 20% for validation  
     "test_ratio": 0.1,       # 10% for testing
@@ -131,6 +131,14 @@ SPLIT_CONFIG = {
     "test_start_date": "2023-01-01",   # Test: 2023+
     "context_minutes": 416,            # Historical context
     "prediction_minutes": 96,          # Future prediction
+}
+
+# Checkpoint Configuration
+CHECKPOINT_CONFIG = {
+    "enabled": False,
+    "checkpoint_dir": SCRIPT_DIR / "finetune_checkpoints",
+    "save_every_n_epochs": 10,  # Save a checkpoint every 10 epochs
+    "keep_last_n_checkpoints": 3, # Keep only the last 3 periodic checkpoints
 }
 
 # ==============================================================================
@@ -1408,7 +1416,16 @@ Degradation: +-8.0%"""
             weight_decay=self.config.weight_decay
         )
         
-        print(f"\n🚀 Starting Enhanced TimesFM 2.0 Finetuning")
+        # --- Load from Checkpoint if available ---
+        if CHECKPOINT_CONFIG["enabled"]:
+            checkpoint_dir = CHECKPOINT_CONFIG["checkpoint_dir"]
+            latest_checkpoint_path = self.load_latest_checkpoint(checkpoint_dir)
+            if latest_checkpoint_path:
+                print(f"   ✅ Resuming training from checkpoint: {latest_checkpoint_path}")
+            else:
+                print("   ℹ️  No checkpoint found, starting fresh training.")
+            
+        print(f"\n🚀 Starting Enhanced TimesFM 2.0 finetuning...")
         print(f"   Device: {self.device}")
         print(f"   Training samples: {len(train_dataset):,}")
         print(f"   Validation samples: {len(val_dataset):,}")
@@ -1479,8 +1496,14 @@ Degradation: +-8.0%"""
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         best_epoch = epoch
+                        is_best = True
                         print(f"   🌟 New best validation loss: {val_loss:.6f}")
+                    else:
+                        is_best = False
                     
+                    # Save checkpoints
+                    self.save_checkpoint(epoch, val_loss, is_best)
+
                     # Plot progress - dashboard every validation run
                     self.plot_training_progress(latest_sample_data=self.latest_sample_data)
                     
@@ -1560,6 +1583,9 @@ Degradation: +-8.0%"""
             print(f"   📊 TensorBoard logs saved to: {tensorboard_run_dir}")
             print(f"   🌐 Start TensorBoard with: tensorboard --logdir={TENSORBOARD_LOG_DIR}")
             print(f"   🌐 Then open: http://localhost:6006")
+        
+        # Clean up old checkpoints
+        self._cleanup_checkpoints(CHECKPOINT_CONFIG["checkpoint_dir"])
         
         return {
             'history': self.training_history,
@@ -1663,6 +1689,63 @@ Degradation: +-8.0%"""
             print(f"   ⚠️  Error creating detailed validation plot: {e}")
             import traceback
             traceback.print_exc()
+
+    def save_checkpoint(self, epoch: int, current_val_loss: float, is_best: bool):
+        """Saves a training checkpoint."""
+        if not CHECKPOINT_CONFIG["enabled"]:
+            return
+
+        checkpoint_dir = CHECKPOINT_CONFIG["checkpoint_dir"]
+        checkpoint_dir.mkdir(exist_ok=True)
+        
+        state = {
+            'epoch': epoch + 1,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'best_val_loss': self.best_val_loss,
+            'training_history': self.training_history,
+            'torch_rng_state': torch.get_rng_state(),
+            'numpy_rng_state': np.random.get_state(),
+        }
+
+        # Save a periodic checkpoint
+        if (epoch + 1) % CHECKPOINT_CONFIG["save_every_n_epochs"] == 0:
+            filename = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pth"
+            torch.save(state, filename)
+            print(f"   💾 Checkpoint saved: {filename}")
+
+            # Clean up old periodic checkpoints
+            self._cleanup_checkpoints(checkpoint_dir)
+
+        # Save a checkpoint if it's the best model so far
+        if is_best:
+            best_filename = checkpoint_dir / "checkpoint_best.pth"
+            torch.save(state, best_filename)
+            print(f"   💾 New best model checkpoint saved: {best_filename}")
+
+    def _cleanup_checkpoints(self, checkpoint_dir: Path):
+        """Removes older checkpoints to save space."""
+        keep_last_n = CHECKPOINT_CONFIG["keep_last_n_checkpoints"]
+        
+        checkpoints = sorted(
+            [p for p in checkpoint_dir.glob("checkpoint_epoch_*.pth")],
+            key=os.path.getmtime
+        )
+        
+        if len(checkpoints) > keep_last_n:
+            for old_checkpoint in checkpoints[:-keep_last_n]:
+                old_checkpoint.unlink()
+                print(f"   🗑️  Removed old checkpoint: {old_checkpoint.name}")
+
+    def load_latest_checkpoint(self, checkpoint_dir: Path) -> Optional[Path]:
+        """Loads the latest checkpoint from the given directory."""
+        checkpoints = sorted(
+            [p for p in checkpoint_dir.glob("checkpoint_epoch_*.pth")],
+            key=os.path.getmtime
+        )
+        if checkpoints:
+            return checkpoints[-1]
+        return None
 
 # ==============================================================================
 # Training Functions
