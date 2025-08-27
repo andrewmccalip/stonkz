@@ -69,3 +69,6 @@ instance/
 *.png
 *.jpg
 /venv310
+/datasets
+/dataset_cache
+/databento

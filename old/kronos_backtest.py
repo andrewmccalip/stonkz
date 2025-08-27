@@ -38,7 +38,7 @@ import torch
 SCRIPT_DIR = Path(__file__).parent
 
 # Backtest Configuration
-NUM_DAYS = 15  # Number of random days to test
+NUM_DAYS = 3000  # Number of random days to test (will save intermediate at 10 days)
 TEST_HOURS = [7, 8, 9, 10, 11]  # Hours to test each day (PT)
 RANDOM_SEED = 42  # For reproducible results
 
@@ -48,7 +48,7 @@ LOOKBACK_MINUTES = 416  # Historical context (416 minutes = ~6.9 hours)
 PREDICTION_HORIZON = 96  # Predict 96 minutes ahead (~1.6 hours)
 
 # Kronos Model Configuration
-KRONOS_MODEL = "NeoQuasar/Kronos-mini"
+KRONOS_MODEL = "NeoQuasar/Kronos-base"
 KRONOS_TOKENIZER = "NeoQuasar/Kronos-Tokenizer-base"
 DEVICE = "cpu"
 MAX_CONTEXT = 512
@@ -372,11 +372,33 @@ def run_backtest():
     predictor = KronosPredictor(model, tokenizer, device=DEVICE, max_context=MAX_CONTEXT)
     print("✅ Kronos model loaded!")
     
-    # Run backtest
-    print(f"\n🔮 Running backtest on {len(test_dates)} days...")
+    # Check for existing intermediate results
+    intermediate_cache = CACHE_DIR / f"backtest_intermediate_{NUM_DAYS}days.pkl"
+    start_idx = 0
     all_results = []
     
-    for date_idx, test_date in enumerate(test_dates):
+    if intermediate_cache.exists():
+        print(f"\n📦 Found intermediate results, checking for resume...")
+        try:
+            with open(intermediate_cache, 'rb') as f:
+                intermediate_data = pickle.load(f)
+            
+            if intermediate_data['total_days'] == len(test_dates):
+                all_results = intermediate_data['results']
+                start_idx = intermediate_data['completed_days']
+                print(f"   ✅ Resuming from day {start_idx + 1} with {len(all_results)} existing predictions")
+            else:
+                print(f"   ⚠️ Intermediate data is for different test size, starting fresh")
+                intermediate_cache.unlink()
+        except Exception as e:
+            print(f"   ⚠️ Failed to load intermediate data: {e}, starting fresh")
+            if intermediate_cache.exists():
+                intermediate_cache.unlink()
+    
+    # Run backtest with intermediate saves
+    print(f"\n🔮 Running backtest on {len(test_dates)} days (starting from day {start_idx + 1})...")
+    
+    for date_idx, test_date in enumerate(test_dates[start_idx:], start=start_idx):
         print(f"\n📅 Day {date_idx+1}/{len(test_dates)}: {test_date}")
         
         # Load day data
@@ -401,10 +423,40 @@ def run_backtest():
                 print("❌ Failed")
         
         print(f"   📊 Day summary: {len(day_results)}/{len(TEST_HOURS)} successful predictions")
+        
+        # Save intermediate results and update plot every 10 days
+        if (date_idx + 1) % 10 == 0 or (date_idx + 1) == len(test_dates):
+            print(f"\n💾 Saving intermediate results after {date_idx + 1} days...")
+            
+            # Save results to cache
+            intermediate_data = {
+                'results': all_results,
+                'test_dates': test_dates[:date_idx + 1],
+                'completed_days': date_idx + 1,
+                'total_days': len(test_dates)
+            }
+            
+            with open(intermediate_cache, 'wb') as f:
+                pickle.dump(intermediate_data, f)
+            
+            # Create intermediate plot
+            if len(all_results) > 0:
+                print(f"📊 Creating intermediate plot with {len(all_results)} predictions...")
+                try:
+                    create_backtest_summary_plot(all_results, test_dates[:date_idx + 1], 
+                                               suffix=f"_intermediate_{date_idx + 1}days")
+                    print(f"✅ Intermediate plot saved")
+                except Exception as e:
+                    print(f"⚠️ Failed to create intermediate plot: {e}")
     
     print(f"\n📈 Backtest completed!")
     print(f"   Total successful predictions: {len(all_results)}")
     print(f"   Success rate: {len(all_results)/(len(test_dates)*len(TEST_HOURS))*100:.1f}%")
+    
+    # Clean up intermediate cache
+    if intermediate_cache.exists():
+        intermediate_cache.unlink()
+        print(f"🧹 Cleaned up intermediate cache")
     
     return all_results, test_dates
 
@@ -412,7 +464,7 @@ def run_backtest():
 # Results Analysis and Plotting
 # ==============================================================================
 
-def create_backtest_summary_plot(results, test_dates):
+def create_backtest_summary_plot(results, test_dates, suffix=""):
     """Create comprehensive summary plots of backtest results"""
     
     if len(results) == 0:
@@ -612,9 +664,19 @@ Model Configuration:
     # Save plot
     plots_dir = SCRIPT_DIR / 'kronos_plots'
     plots_dir.mkdir(exist_ok=True)
-    plot_path = plots_dir / f'kronos_backtest_{NUM_DAYS}days.png'
+    
+    if suffix:
+        plot_path = plots_dir / f'kronos_backtest{suffix}.png'
+    else:
+        plot_path = plots_dir / f'kronos_backtest_{len(test_dates)}days.png'
+    
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     print(f"\n📊 Backtest summary plot saved to: {plot_path}")
+    
+    # Also save as latest plot for easy access
+    latest_path = plots_dir / 'kronos_backtest_latest.png'
+    plt.savefig(latest_path, dpi=150, bbox_inches='tight')
+    print(f"📊 Latest plot also saved to: {latest_path}")
     
     plt.close()
     
