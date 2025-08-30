@@ -43,9 +43,9 @@ SCRIPT_DIR = Path(__file__).parent
 sys.path.append(str(SCRIPT_DIR))
 
 # Import prediction models
-from prediction_sundial import predict_sundial, get_model_info as get_sundial_info
+# from prediction_sundial import predict_sundial, get_model_info as get_sundial_info
 # Future imports can be added here:
-# from prediction_timesfm_v2 import predict_timesfm_v2, get_model_info as get_timesfm_info
+from prediction_timesfm_v2 import predict_timesfm_v2, get_model_info as get_timesfm_info
 # from prediction_chronos import predict_chronos, get_model_info as get_chronos_info
 
 # ==============================================================================
@@ -53,7 +53,7 @@ from prediction_sundial import predict_sundial, get_model_info as get_sundial_in
 # ==============================================================================
 
 # Backtesting parameters
-NUM_TEST_CASES = 500           # Number of test cases to run
+NUM_TEST_CASES = 150           # Number of test cases to run
 CONTEXT_LENGTH = 416           # Historical context in minutes (~6.9 hours)
 HORIZON_LENGTH = 96            # Prediction horizon in minutes (~1.6 hours)
 RANDOM_SEED = 42              # For reproducibility
@@ -65,19 +65,19 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 # Model registry - add new models here
 MODEL_REGISTRY = {
-    'sundial': {
-        'predict_fn': predict_sundial,
-        'info_fn': get_sundial_info,
-        'display_name': 'Sundial Base 128M',
-        'color': '#FF6B6B'
-    },
-    # Add more models as they become available:
-    # 'timesfm_v2': {
-    #     'predict_fn': predict_timesfm_v2,
-    #     'info_fn': get_timesfm_info,
-    #     'display_name': 'TimesFM 2.0',
-    #     'color': '#4ECDC4'
+    # 'sundial': {
+    #     'predict_fn': predict_sundial,
+    #     'info_fn': get_sundial_info,
+    #     'display_name': 'Sundial Base 128M',
+    #     'color': '#FF6B6B'
     # },
+    # Add more models as they become available:
+    'timesfm_v2': {
+        'predict_fn': predict_timesfm_v2,
+        'info_fn': get_timesfm_info,
+        'display_name': 'TimesFM 2.0',
+        'color': '#4ECDC4'
+    },
 }
 
 # ==============================================================================
@@ -579,7 +579,7 @@ class BacktestEngine:
         fig = plt.figure(figsize=(24, 20))
         
         # Create grid specification
-        gs = gridspec.GridSpec(5, 4, figure=fig, hspace=0.3, wspace=0.25)
+        gs = gridspec.GridSpec(4, 4, figure=fig, hspace=0.3, wspace=0.25)
         
         # Title
         fig.suptitle(f'Comprehensive Backtest Analysis - {self.model_config["display_name"]}', 
@@ -897,48 +897,7 @@ class BacktestEngine:
             ax7.grid(True, alpha=0.3)
             ax7.legend()
         
-        # ==============================================================================
-        # 8. Sample Predictions Visualization
-        # ==============================================================================
-        ax8 = fig.add_subplot(gs[4, :])
-        
-        # Select a few representative cases to visualize
-        # Sort by directional accuracy and pick best, median, and worst
-        sorted_results = sorted(successful_results, key=lambda x: x['metrics']['directional_accuracy'])
-        
-        sample_indices = []
-        if len(sorted_results) >= 3:
-            sample_indices = [0, len(sorted_results)//2, -1]  # Worst, median, best
-        elif len(sorted_results) == 2:
-            sample_indices = [0, 1]
-        elif len(sorted_results) == 1:
-            sample_indices = [0]
-        
-        # Plot samples
-        for idx, sample_idx in enumerate(sample_indices):
-            result = sorted_results[sample_idx]
-            predictions = np.array(result['predictions'])
-            actuals = np.array(result['actuals'])
-            
-            # Create time axis
-            time_axis = np.arange(len(predictions))
-            
-            # Offset for visibility
-            offset = idx * 0.02
-            
-            # Plot
-            label_suffix = ['(Worst)', '(Median)', '(Best)'][idx] if len(sample_indices) == 3 else f'(Sample {idx+1})'
-            ax8.plot(time_axis, actuals + offset, 'k-', alpha=0.7, linewidth=1.5, 
-                    label=f'Actual {label_suffix}' if idx == 0 else None)
-            ax8.plot(time_axis, predictions + offset, '--', color=self.model_config['color'], 
-                    alpha=0.7, linewidth=1.5,
-                    label=f'Predicted - DA: {result["metrics"]["directional_accuracy"]:.1f}% {label_suffix}')
-        
-        ax8.set_xlabel('Time (minutes)', fontsize=12)
-        ax8.set_ylabel('Normalized Price', fontsize=12)
-        ax8.set_title('Sample Prediction Comparisons', fontsize=14, fontweight='bold')
-        ax8.legend(loc='best')
-        ax8.grid(True, alpha=0.3)
+        # Sample prediction subplot removed as requested
         
         # Add performance summary text
         summary_text = f'Model: {self.model_config["display_name"]}\n'
@@ -1222,7 +1181,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Unified backtest framework for time series prediction models')
-    parser.add_argument('--model', type=str, default='sundial',
+    parser.add_argument('--model', type=str, default='timesfm_v2',
                       choices=list(MODEL_REGISTRY.keys()),
                       help='Model to test')
     parser.add_argument('--cases', type=int, default=NUM_TEST_CASES,

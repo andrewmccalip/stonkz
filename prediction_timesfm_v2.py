@@ -14,7 +14,9 @@ warnings.filterwarnings('ignore')
 
 import numpy as np
 import pandas as pd
-import timesfm
+import sys
+sys.path.append('timesfm/src')
+import timesfm.timesfm_torch as timesfm
 
 # Add project paths
 SCRIPT_DIR = Path(__file__).parent
@@ -110,8 +112,8 @@ def _load_model():
         print(f"🤖 Loading TimesFM 2.0 500M model...")
         
         # Initialize TimesFM 2.0 with correct parameters
-        model = timesfm.TimesFm(
-            hparams=timesfm.TimesFmHparams(
+        model = timesfm.TimesFmTorch(
+            hparams=timesfm.timesfm_base.TimesFmHparams(
                 backend=DEVICE,
                 per_core_batch_size=32,
                 horizon_len=HORIZON_LENGTH,  # Set to our desired horizon
@@ -122,7 +124,7 @@ def _load_model():
                 use_positional_embedding=USE_POSITIONAL_EMBEDDING,  # Fixed for 500M model
                 context_len=2048,  # Model's max context (we'll use up to 416)
             ),
-            checkpoint=timesfm.TimesFmCheckpoint(
+            checkpoint=timesfm.timesfm_base.TimesFmCheckpoint(
                 huggingface_repo_id=MODEL_REPO
             ),
         )
