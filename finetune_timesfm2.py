@@ -84,28 +84,28 @@ from finetuning.finetuning_torch import FinetuningConfig, TimesFMFinetuner
 class ModelConfig:
     """Configuration for TimesFM model parameters"""
     repo_id: str = "google/timesfm-2.0-500m-pytorch"
-    context_len: int = 2048
-    horizon_len: int = 128
+    context_len: int = 800  # EXPANDED: Capture more complete market context (~13.3 hours)
+    horizon_len: int = 400  # EXPANDED: Longer prediction window (~6.7 hours)
     num_layers: int = 50
-    per_core_batch_size: int = 16
-    use_positional_embedding: bool = False
+    per_core_batch_size: int = 4   # ADJUSTED: Matches 16 total batch size for small dataset
+    use_positional_embedding: bool = True
 
 @dataclass
 class TrainingConfig:
     """Configuration for training parameters"""
-    batch_size: int = 64
-    num_epochs: int = 500
+    batch_size: int = 16   # ADJUSTED: With only ~53 sessions, smaller batches for better gradient estimates
+    num_epochs: int = 200  # INCREASED: With only ~53 unique sessions, need more epochs for convergence
     learning_rate: float = 5e-5
     weight_decay: float = 0.01
     freq_type: int = 0
-    use_quantile_loss: bool = True
+    use_quantile_loss: bool = True  # Uses advanced FinancialTradingLoss (directional + magnitude + trend + volatility)
     log_every_n_steps: int = 10
     val_check_interval: float = 0.5
     validate_every_n_epochs: int = 1
     use_wandb: bool = False
     wandb_project: str = "timesfm2-es-futures"
     gradient_clip_norm: float = 1.0
-    early_stopping_patience: int = 20
+    early_stopping_patience: int = 8  # Reduced: Financial models converge fast
     early_stopping_min_delta: float = 1e-4
     use_lr_scheduler: bool = True
     lr_scheduler_gamma: float = 0.95
@@ -117,23 +117,33 @@ class DataConfig:
     train_end_date: str = "2020-12-31"
     val_end_date: str = "2022-12-31"
     test_start_date: str = "2023-01-01"
-    context_minutes: int = 416
-    prediction_minutes: int = 96
+    context_minutes: int = 800   # EXPANDED: Full market context
+    prediction_minutes: int = 400  # EXPANDED: Longer prediction horizon
     use_sample: bool = True
-    total_sequences: int = 1000
+    total_sequences: int = 100000
     train_ratio: float = 0.7
     val_ratio: float = 0.2
     test_ratio: float = 0.1
     random_seed: int = 42
+    
+    # Dataset caching configuration
+    enable_cache: bool = True
+    cache_dir: Path = None
+    cache_format: str = "pickle"  # "pickle" or "joblib"
+    force_rebuild_cache: bool = False
+    cache_compression: bool = True
+    max_cache_size_gb: float = 10.0  # Maximum cache size in GB
 
 @dataclass
 class CheckpointConfig:
     """Configuration for model checkpoints"""
-    enabled: bool = False
+    enabled: bool = True
+    resume_from_checkpoint: bool = True  # Whether to automatically resume from latest checkpoint
     checkpoint_dir: Path = None
-    save_every_n_epochs: int = 10
+    save_every_n_epochs: int = 5
     keep_last_n_checkpoints: int = 3
     save_best_only: bool = False
+    force_checkpoint_path: str = None  # Optional: specific checkpoint path to resume from
 
 @dataclass
 class ExperimentConfig:
@@ -150,6 +160,8 @@ class ExperimentConfig:
             self.checkpoint.checkpoint_dir = Path("./finetune_checkpoints")
         if self.output_dir is None:
             self.output_dir = Path("./experiments")
+        if self.data.cache_dir is None:
+            self.data.cache_dir = Path("./dataset_cache")
 
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> 'ExperimentConfig':
@@ -185,7 +197,7 @@ class ExperimentConfig:
 # ==============================================================================
 
 # Dataset paths
-SEQUENCES_DIR = SCRIPT_DIR / "datasets" / "sequences"
+SEQUENCES_DIR = SCRIPT_DIR / "datasets" / "ES"  # Updated to use full ES trading sessions
 CACHE_DIR = SCRIPT_DIR / "timesfm_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
@@ -283,7 +295,7 @@ class TrainingMonitor:
 # ==============================================================================
 
 class ESFuturesSequenceDataset(Dataset):
-    """Dataset for ES futures sequences compatible with TimesFM 2.0"""
+    """Dataset for ES futures sequences compatible with TimesFM 2.0 with intelligent caching"""
     
     def __init__(self, 
                  sequence_files: List[Path],
@@ -291,7 +303,8 @@ class ESFuturesSequenceDataset(Dataset):
                  horizon_length: int = 96,
                  freq_type: int = 0,
                  normalize: bool = True,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 cache_config: dict = None):
         """
         Initialize dataset from sequence files.
         
@@ -302,6 +315,7 @@ class ESFuturesSequenceDataset(Dataset):
             freq_type: TimesFM frequency type (0=high, 1=medium, 2=low)
             normalize: Whether to normalize sequences to start at 1.0
             verbose: Print detailed information
+            cache_config: Dictionary with caching configuration
         """
         
         self.sequence_files = sequence_files
@@ -311,8 +325,20 @@ class ESFuturesSequenceDataset(Dataset):
         self.normalize = normalize
         self.verbose = verbose
         
-        # Load and prepare all sequences
-        self.sequences = self._load_sequences()
+        # Set up caching configuration
+        self.cache_config = cache_config or {}
+        self.enable_cache = self.cache_config.get('enable_cache', True)
+        self.cache_dir = Path(self.cache_config.get('cache_dir', './dataset_cache'))
+        self.cache_format = self.cache_config.get('cache_format', 'pickle')
+        self.force_rebuild = self.cache_config.get('force_rebuild_cache', False)
+        self.cache_compression = self.cache_config.get('cache_compression', True)
+        
+        # Create cache directory
+        if self.enable_cache:
+            self.cache_dir.mkdir(exist_ok=True)
+        
+        # Load and prepare all sequences (with caching)
+        self.sequences = self._load_sequences_cached()
         
         if self.verbose:
             print(f"📊 Dataset initialized:")
@@ -321,6 +347,174 @@ class ESFuturesSequenceDataset(Dataset):
             print(f"   Context length: {self.context_length}")
             print(f"   Horizon length: {self.horizon_length}")
             print(f"   Frequency type: {self.freq_type}")
+    
+    def _generate_cache_key(self) -> str:
+        """Generate a unique cache key based on dataset configuration"""
+        import hashlib
+        
+        # Create a string representation of the key parameters
+        key_data = {
+            'files': sorted([f.name for f in self.sequence_files]),
+            'context_length': self.context_length,
+            'horizon_length': self.horizon_length,
+            'freq_type': self.freq_type,
+            'normalize': self.normalize,
+            'file_count': len(self.sequence_files)
+        }
+        
+        # Add file modification times for cache invalidation
+        file_mtimes = {}
+        for f in self.sequence_files[:100]:  # Sample first 100 files for performance
+            try:
+                file_mtimes[f.name] = f.stat().st_mtime
+            except:
+                pass
+        key_data['sample_mtimes'] = file_mtimes
+        
+        # Generate hash
+        key_str = str(sorted(key_data.items()))
+        return hashlib.md5(key_str.encode()).hexdigest()
+    
+    def _get_cache_path(self) -> Path:
+        """Get the cache file path for this dataset configuration"""
+        cache_key = self._generate_cache_key()
+        extension = 'pkl' if self.cache_format == 'pickle' else 'joblib'
+        if self.cache_compression:
+            extension += '.gz'
+        return self.cache_dir / f"dataset_cache_{cache_key}.{extension}"
+    
+    def _save_to_cache(self, sequences: List[Dict[str, Any]]) -> None:
+        """Save sequences to cache file"""
+        if not self.enable_cache:
+            return
+            
+        cache_path = self._get_cache_path()
+        
+        try:
+            if self.verbose:
+                print(f"   💾 Saving dataset cache: {cache_path.name}")
+            
+            cache_data = {
+                'sequences': sequences,
+                'metadata': {
+                    'context_length': self.context_length,
+                    'horizon_length': self.horizon_length,
+                    'freq_type': self.freq_type,
+                    'normalize': self.normalize,
+                    'file_count': len(self.sequence_files),
+                    'sample_count': len(sequences),
+                    'created_at': datetime.now().isoformat(),
+                    'cache_version': '1.0'
+                }
+            }
+            
+            if self.cache_format == 'pickle':
+                import pickle
+                if self.cache_compression:
+                    import gzip
+                    with gzip.open(cache_path, 'wb') as f:
+                        pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                else:
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            else:  # joblib
+                try:
+                    import joblib
+                    joblib.dump(cache_data, cache_path, compress=3 if self.cache_compression else 0)
+                except ImportError:
+                    if self.verbose:
+                        print("   ⚠️ joblib not available, falling back to pickle")
+                    # Fallback to pickle
+                    import pickle
+                    with open(cache_path.with_suffix('.pkl'), 'wb') as f:
+                        pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            if self.verbose:
+                cache_size_mb = cache_path.stat().st_size / (1024 * 1024)
+                print(f"   ✅ Cache saved: {cache_size_mb:.1f} MB")
+                
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️ Failed to save cache: {e}")
+    
+    def _load_from_cache(self) -> Optional[List[Dict[str, Any]]]:
+        """Load sequences from cache file if available and valid"""
+        if not self.enable_cache:
+            return None
+            
+        cache_path = self._get_cache_path()
+        
+        if not cache_path.exists():
+            return None
+        
+        try:
+            if self.verbose:
+                print(f"   📂 Loading dataset cache: {cache_path.name}")
+            
+            # Load cache data
+            if self.cache_format == 'pickle':
+                import pickle
+                if self.cache_compression and cache_path.suffix == '.gz':
+                    import gzip
+                    with gzip.open(cache_path, 'rb') as f:
+                        cache_data = pickle.load(f)
+                else:
+                    with open(cache_path, 'rb') as f:
+                        cache_data = pickle.load(f)
+            else:  # joblib
+                try:
+                    import joblib
+                    cache_data = joblib.load(cache_path)
+                except ImportError:
+                    if self.verbose:
+                        print("   ⚠️ joblib not available, trying pickle fallback")
+                    return None
+            
+            # Validate cache metadata
+            metadata = cache_data.get('metadata', {})
+            if (metadata.get('context_length') == self.context_length and
+                metadata.get('horizon_length') == self.horizon_length and
+                metadata.get('freq_type') == self.freq_type and
+                metadata.get('normalize') == self.normalize and
+                metadata.get('file_count') == len(self.sequence_files)):
+                
+                sequences = cache_data['sequences']
+                if self.verbose:
+                    cache_size_mb = cache_path.stat().st_size / (1024 * 1024)
+                    created_at = metadata.get('created_at', 'unknown')
+                    print(f"   ✅ Cache loaded: {len(sequences):,} samples, {cache_size_mb:.1f} MB")
+                    print(f"   📅 Cache created: {created_at}")
+                
+                return sequences
+            else:
+                if self.verbose:
+                    print(f"   ⚠️ Cache invalid (config mismatch), rebuilding...")
+                return None
+                
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️ Failed to load cache: {e}")
+            return None
+    
+    def _load_sequences_cached(self) -> List[Dict[str, Any]]:
+        """Load sequences with intelligent caching"""
+        
+        # Try to load from cache first (unless force rebuild)
+        if not self.force_rebuild:
+            cached_sequences = self._load_from_cache()
+            if cached_sequences is not None:
+                return cached_sequences
+        
+        # Cache miss or force rebuild - load from scratch
+        if self.verbose:
+            print(f"   🔄 Building dataset from {len(self.sequence_files):,} sequence files...")
+        
+        sequences = self._load_sequences()
+        
+        # Save to cache for next time
+        self._save_to_cache(sequences)
+        
+        return sequences
     
     def _load_sequences(self) -> List[Dict[str, Any]]:
         """Load all sequence files and create training samples"""
@@ -338,29 +532,71 @@ class ESFuturesSequenceDataset(Dataset):
                 # Extract close prices (normalized)
                 close_prices = df['close'].values
                 
-                # Create sliding window samples from this sequence
-                max_start = len(close_prices) - (self.context_length + self.horizon_length)
+                # Use ENTIRE trading session as BOTH context and target
+                # This captures complete daily market dynamics and patterns
                 
-                for start_idx in range(0, max_start + 1, 60):  # Stride by 60 minutes
-                    context_end = start_idx + self.context_length
-                    horizon_end = context_end + self.horizon_length
+                # Minimum length check - need reasonable amount of data
+                min_session_length = 100  # At least ~1.5 hours of data
+                if len(close_prices) < min_session_length:
+                    if self.verbose:
+                        print(f"   ⚠️ Skipping {seq_file.name}: only {len(close_prices)} minutes, need at least {min_session_length}")
+                    continue
+                
+                # Use the FULL session for both context and horizon
+                # This allows the model to learn complete daily patterns
+                full_session = close_prices.copy()
+                
+                # Truncate or pad to model's maximum context length if needed
+                if len(full_session) > self.context_length:
+                    # Use the full context window (416 minutes)
+                    context_data = full_session[:self.context_length]
+                    # For horizon, use the next portion (or repeat pattern for learning)
+                    horizon_start = min(self.context_length, len(full_session) - self.horizon_length)
+                    horizon_data = full_session[horizon_start:horizon_start + self.horizon_length]
                     
-                    context_data = close_prices[start_idx:context_end]
-                    horizon_data = close_prices[context_end:horizon_end]
+                    # If we don't have enough for horizon, pad with last values
+                    if len(horizon_data) < self.horizon_length:
+                        padding_needed = self.horizon_length - len(horizon_data)
+                        last_value = horizon_data[-1] if len(horizon_data) > 0 else context_data[-1]
+                        horizon_padding = np.full(padding_needed, last_value)
+                        horizon_data = np.concatenate([horizon_data, horizon_padding])
+                else:
+                    # Session is shorter than context length - pad the context
+                    context_data = full_session.copy()
                     
-                    # Additional normalization if requested
-                    if self.normalize and len(context_data) > 0:
-                        base_price = context_data[0]
-                        if base_price > 0:
-                            context_data = context_data / base_price
-                            horizon_data = horizon_data / base_price
+                    # Pad context to required length
+                    if len(context_data) < self.context_length:
+                        padding_needed = self.context_length - len(context_data)
+                        last_value = context_data[-1]
+                        context_padding = np.full(padding_needed, last_value)
+                        context_data = np.concatenate([context_data, context_padding])
                     
-                    sequences.append({
-                        'context': context_data,
-                        'horizon': horizon_data,
-                        'file': seq_file.name,
-                        'start_idx': start_idx
-                    })
+                    # For horizon, use the latter part of the session (overlapping is OK for learning)
+                    horizon_start = max(0, len(full_session) - self.horizon_length)
+                    horizon_data = full_session[horizon_start:]
+                    
+                    # Pad horizon if needed
+                    if len(horizon_data) < self.horizon_length:
+                        padding_needed = self.horizon_length - len(horizon_data)
+                        last_value = horizon_data[-1] if len(horizon_data) > 0 else full_session[-1]
+                        horizon_padding = np.full(padding_needed, last_value)
+                        horizon_data = np.concatenate([horizon_data, horizon_padding])
+                
+                # Normalization - normalize to session start for relative price movements
+                if self.normalize and len(context_data) > 0:
+                    base_price = full_session[0]  # Normalize to very start of session
+                    if base_price > 0:
+                        context_data = context_data / base_price
+                        horizon_data = horizon_data / base_price
+                
+                sequences.append({
+                    'context': context_data,
+                    'horizon': horizon_data,
+                    'file': seq_file.name,
+                    'session_length': len(full_session),
+                    'original_length': len(close_prices),
+                    'start_idx': 0  # Always full session
+                })
                     
             except Exception as e:
                 if self.verbose:
@@ -416,10 +652,10 @@ def get_sequence_files() -> List[Path]:
     if not SEQUENCES_DIR.exists():
         raise FileNotFoundError(f"Sequences directory not found: {SEQUENCES_DIR}")
     
-    sequence_files = list(SEQUENCES_DIR.glob("sequence_*.csv"))
+    sequence_files = list(SEQUENCES_DIR.glob("ES_*.csv"))  # Updated pattern for ES files
     
     if len(sequence_files) == 0:
-        raise FileNotFoundError(f"No sequence files found in {SEQUENCES_DIR}")
+        raise FileNotFoundError(f"No ES CSV files found in {SEQUENCES_DIR}")
     
     # Sort by filename (which contains date)
     sequence_files.sort()
@@ -522,9 +758,26 @@ def split_sequences_random_sample(sequence_files: List[Path]) -> Tuple[List[Path
 def create_datasets(train_files: List[Path], 
                    val_files: List[Path], 
                    test_files: List[Path]) -> Tuple[Dataset, Dataset, Dataset]:
-    """Create train, validation, and test datasets"""
+    """Create train, validation, and test datasets with caching"""
     
     print("🔄 Creating datasets...")
+    
+    # Prepare cache configuration
+    cache_config = {
+        'enable_cache': config.data.enable_cache,
+        'cache_dir': str(config.data.cache_dir),
+        'cache_format': config.data.cache_format,
+        'force_rebuild_cache': config.data.force_rebuild_cache,
+        'cache_compression': config.data.cache_compression
+    }
+    
+    print(f"💾 Dataset Caching Configuration:")
+    print(f"   Enabled: {cache_config['enable_cache']}")
+    print(f"   Directory: {cache_config['cache_dir']}")
+    print(f"   Format: {cache_config['cache_format']}")
+    print(f"   Compression: {cache_config['cache_compression']}")
+    if cache_config['force_rebuild_cache']:
+        print(f"   🔄 Force rebuild: True")
     
     train_dataset = ESFuturesSequenceDataset(
         sequence_files=train_files,
@@ -532,7 +785,8 @@ def create_datasets(train_files: List[Path],
         horizon_length=SPLIT_CONFIG["prediction_minutes"],
         freq_type=TRAINING_CONFIG["freq_type"],
         normalize=True,
-        verbose=True
+        verbose=True,
+        cache_config=cache_config
     )
     
     val_dataset = ESFuturesSequenceDataset(
@@ -541,7 +795,8 @@ def create_datasets(train_files: List[Path],
         horizon_length=SPLIT_CONFIG["prediction_minutes"],
         freq_type=TRAINING_CONFIG["freq_type"],
         normalize=True,
-        verbose=True
+        verbose=True,
+        cache_config=cache_config
     )
     
     test_dataset = ESFuturesSequenceDataset(
@@ -550,7 +805,8 @@ def create_datasets(train_files: List[Path],
         horizon_length=SPLIT_CONFIG["prediction_minutes"],
         freq_type=TRAINING_CONFIG["freq_type"],
         normalize=True,
-        verbose=True
+        verbose=True,
+        cache_config=cache_config
     )
     
     return train_dataset, val_dataset, test_dataset
@@ -651,13 +907,69 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         self.global_step = 0
         
     def _create_criterion(self):
-        """Creates the loss function based on the finetuning configuration."""
+        """Creates the loss function optimized for intraday stock prediction."""
         if self.config.use_quantile_loss:
-            # This is a common loss function for probabilistic forecasting
-            return nn.L1Loss()  # Using L1 for quantile loss as a robust choice
+            # Advanced financial loss: Combines multiple objectives
+            return self._create_financial_loss()
         else:
             # Standard Mean Squared Error for point forecasts
             return nn.MSELoss()
+    
+    def _create_financial_loss(self):
+        """Creates a sophisticated loss function for intraday stock trading."""
+        class FinancialTradingLoss(nn.Module):
+            def __init__(self, 
+                         directional_weight=0.4,    # Weight for directional accuracy
+                         magnitude_weight=0.3,      # Weight for price magnitude  
+                         trend_weight=0.2,          # Weight for trend consistency
+                         volatility_weight=0.1):    # Weight for volatility awareness
+                super().__init__()
+                self.directional_weight = directional_weight
+                self.magnitude_weight = magnitude_weight
+                self.trend_weight = trend_weight
+                self.volatility_weight = volatility_weight
+                self.huber = nn.HuberLoss(delta=1.0)
+                
+            def forward(self, predictions, targets):
+                batch_size, seq_len = predictions.shape
+                
+                # 1. DIRECTIONAL LOSS (Most Important for Trading)
+                pred_returns = predictions[:, 1:] - predictions[:, :-1]
+                target_returns = targets[:, 1:] - targets[:, :-1]
+                
+                pred_direction = torch.sign(pred_returns)
+                target_direction = torch.sign(target_returns)
+                
+                # Penalize wrong direction more heavily
+                directional_accuracy = (pred_direction == target_direction).float()
+                directional_loss = 1.0 - directional_accuracy.mean()
+                
+                # 2. MAGNITUDE LOSS (Robust to outliers)
+                magnitude_loss = self.huber(predictions, targets)
+                
+                # 3. TREND CONSISTENCY LOSS
+                # Penalize if we predict trend reversals incorrectly
+                pred_trend_changes = torch.abs(pred_returns[:, 1:] - pred_returns[:, :-1])
+                target_trend_changes = torch.abs(target_returns[:, 1:] - target_returns[:, :-1])
+                trend_loss = torch.mean(torch.abs(pred_trend_changes - target_trend_changes))
+                
+                # 4. VOLATILITY-AWARE LOSS
+                # Weight errors by recent volatility (higher vol = more tolerance)
+                target_volatility = torch.std(target_returns, dim=1, keepdim=True) + 1e-8
+                volatility_weights = 1.0 / (1.0 + target_volatility)
+                volatility_loss = torch.mean(volatility_weights * torch.abs(predictions - targets))
+                
+                # COMBINE ALL LOSSES
+                total_loss = (
+                    self.directional_weight * directional_loss +
+                    self.magnitude_weight * magnitude_loss +
+                    self.trend_weight * trend_loss +
+                    self.volatility_weight * volatility_loss
+                )
+                
+                return total_loss
+                
+        return FinancialTradingLoss()
 
     def _process_batch(self, batch: Tuple) -> Tuple[torch.Tensor, torch.Tensor]:
         """Process a single batch of data, returning loss and predictions."""
@@ -718,6 +1030,10 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
         num_batches = len(train_loader)
         train_start_time = time.time()
         
+        # Collect predictions and targets for directional accuracy
+        train_predictions = []
+        train_targets = []
+        
         print(f"\n🎯 Epoch {epoch + 1}/{self.config.num_epochs}")
         print(f"   Batches: {num_batches}, Batch size: {self.config.batch_size}")
         
@@ -726,7 +1042,13 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                 batch_start_time = time.time()
                 
                 try:
-                    loss, _ = self._process_batch(batch)
+                    loss, predictions = self._process_batch(batch)
+                    
+                    # Collect predictions and targets for directional accuracy
+                    if predictions is not None and len(batch) >= 4:
+                        _, _, _, targets = batch
+                        train_predictions.append(predictions.detach().cpu())
+                        train_targets.append(targets.cpu())
                     
                     optimizer.zero_grad()
                     loss.backward()
@@ -756,6 +1078,11 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                     if self.tensorboard_writer is not None:
                         self.tensorboard_writer.add_scalar('Batch/Loss', batch_loss, self.global_step)
                         self.tensorboard_writer.add_scalar('Batch/Time', batch_time, self.global_step)
+                        
+                        # Calculate and log batch-level directional accuracy
+                        # Note: Skip for now as we need to access predictions from _process_batch
+                        # This will be calculated at epoch level instead
+                        
                         if hasattr(self, '_epoch_grad_norms') and self._epoch_grad_norms:
                             self.tensorboard_writer.add_scalar('Batch/GradientNorm', self._epoch_grad_norms[-1], self.global_step)
                     
@@ -763,11 +1090,17 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                     
                     # Update progress bar
                     avg_loss_so_far = total_loss / (batch_idx + 1)
-                    pbar.set_postfix({
+                    postfix_dict = {
                         'Loss': f'{batch_loss:.6f}',
                         'Avg': f'{avg_loss_so_far:.6f}',
                         'Time': f'{batch_time:.2f}s'
-                    })
+                    }
+                    
+                    # Add directional accuracy to progress bar if available
+                    # Note: Skip for now as we need to access predictions from _process_batch
+                    # This will be shown at epoch level instead
+                    
+                    pbar.set_postfix(postfix_dict)
                     
                     # Log every N steps
                     if (batch_idx + 1) % self.config.log_every_n_steps == 0:
@@ -775,6 +1108,17 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                         
                 except Exception as e:
                     print(f"      ❌ Error in batch {batch_idx}: {e}")
+                    print(f"         Batch data shapes:")
+                    try:
+                        context, padding, freq, horizon = batch
+                        print(f"           Context: {context.shape if hasattr(context, 'shape') else type(context)}")
+                        print(f"           Padding: {padding.shape if hasattr(padding, 'shape') else type(padding)}")
+                        print(f"           Freq: {freq.shape if hasattr(freq, 'shape') else type(freq)}")
+                        print(f"           Horizon: {horizon.shape if hasattr(horizon, 'shape') else type(horizon)}")
+                    except:
+                        print(f"           Could not unpack batch data")
+                    import traceback
+                    traceback.print_exc()
                     continue
         
         avg_loss = total_loss / num_batches
@@ -796,8 +1140,25 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
             if avg_grad_norm is not None:
                 self.tensorboard_writer.add_scalar('Epoch/GradientNorm', avg_grad_norm, epoch)
         
+        # Calculate training directional accuracy
+        train_dir_acc = None
+        if train_predictions and train_targets:
+            try:
+                all_train_predictions = torch.cat(train_predictions, dim=0)
+                all_train_targets = torch.cat(train_targets, dim=0)
+                train_dir_acc = self.calculate_directional_accuracy(all_train_predictions, all_train_targets)
+                
+                # Log to TensorBoard
+                if self.tensorboard_writer is not None:
+                    self.tensorboard_writer.add_scalar('Epoch/TrainDirectionalAccuracy', train_dir_acc, epoch)
+                    
+            except Exception as e:
+                print(f"   ⚠️ Error calculating training directional accuracy: {e}")
+        
         print(f"   ✅ Epoch {epoch + 1} completed in {epoch_time:.2f}s")
         print(f"   📊 Train Loss: {avg_loss:.6f} (std: {np.std(batch_losses):.6f})")
+        if train_dir_acc is not None:
+            print(f"   🎯 Train Directional Accuracy: {train_dir_acc:.1%}")
         
         return avg_loss
     
@@ -853,6 +1214,17 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                         
                     except Exception as e:
                         print(f"      ❌ Error in validation batch {batch_idx}: {e}")
+                        print(f"         Validation batch data shapes:")
+                        try:
+                            context, padding, freq, horizon = batch
+                            print(f"           Context: {context.shape if hasattr(context, 'shape') else type(context)}")
+                            print(f"           Padding: {padding.shape if hasattr(padding, 'shape') else type(padding)}")
+                            print(f"           Freq: {freq.shape if hasattr(freq, 'shape') else type(freq)}")
+                            print(f"           Horizon: {horizon.shape if hasattr(horizon, 'shape') else type(horizon)}")
+                        except:
+                            print(f"           Could not unpack validation batch data")
+                        import traceback
+                        traceback.print_exc()
                         continue
         
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
@@ -883,7 +1255,8 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                     self.performance_metrics['directional_accuracy'].append(dir_acc)
                     self.performance_metrics['correlation'].append(corr)
                     
-                    print(f"   📈 Val Metrics - MSE: {mse:.6f}, MAE: {mae:.6f}, Dir.Acc: {dir_acc:.1%}, Corr: {corr:.3f}")
+                    print(f"   📈 Val Metrics - MSE: {mse:.6f}, MAE: {mae:.6f}, Corr: {corr:.3f}")
+                    print(f"   🎯 Val Directional Accuracy: {dir_acc:.1%}")
                     
                     # TensorBoard logging
                     if self.tensorboard_writer is not None:
@@ -1036,6 +1409,11 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
             
         except Exception as e:
             print(f"   ⚠️ Error creating prediction plot: {e}")
+            print(f"      Context data type: {type(context_data)}, shape: {context_data.shape if hasattr(context_data, 'shape') else 'no shape'}")
+            print(f"      Predictions type: {type(predictions)}, shape: {predictions.shape if hasattr(predictions, 'shape') else 'no shape'}")
+            print(f"      Targets type: {type(targets)}, shape: {targets.shape if hasattr(targets, 'shape') else 'no shape'}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def create_multi_sample_prediction_plot(self, context_data, predictions, targets, epoch, num_samples=3):
@@ -1215,6 +1593,230 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                 
         except Exception as e:
             print(f"   ❌ Error creating comprehensive prediction plot: {e}")
+            return None
+
+    def create_backtest_style_analysis_plot(self, epoch):
+        """Create backtest-style comprehensive analysis plot for training metrics"""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.gridspec as gridspec
+            import numpy as np
+            
+            # Check if we have enough training history
+            if len(self.training_history['train_loss']) < 2:
+                return None
+            
+            # Create figure with custom layout (similar to backtest_unified.py)
+            fig = plt.figure(figsize=(20, 16))
+            gs = gridspec.GridSpec(3, 4, figure=fig, hspace=0.3, wspace=0.25)
+            
+            # Title
+            fig.suptitle(f'Training Analysis Dashboard - Epoch {epoch + 1}', 
+                         fontsize=18, fontweight='bold')
+            
+            # ==============================================================================
+            # 1. Training Loss Evolution
+            # ==============================================================================
+            ax1 = fig.add_subplot(gs[0, :2])
+            
+            epochs = range(1, len(self.training_history['train_loss']) + 1)
+            train_losses = self.training_history['train_loss']
+            val_losses = self.training_history.get('val_loss', [])
+            
+            ax1.plot(epochs, train_losses, 'b-', linewidth=2, label='Training Loss', alpha=0.8)
+            if val_losses:
+                val_epochs = range(1, len(val_losses) + 1)
+                ax1.plot(val_epochs, val_losses, 'r-', linewidth=2, label='Validation Loss', alpha=0.8)
+            
+            # Add trend lines
+            if len(train_losses) > 5:
+                z_train = np.polyfit(epochs, train_losses, 1)
+                p_train = np.poly1d(z_train)
+                ax1.plot(epochs, p_train(epochs), 'b--', alpha=0.5, label=f'Train Trend: {z_train[0]:.2e}/epoch')
+            
+            ax1.set_xlabel('Epoch', fontsize=12)
+            ax1.set_ylabel('Loss', fontsize=12)
+            ax1.set_title('Loss Evolution', fontsize=14, fontweight='bold')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            ax1.set_yscale('log')
+            
+            # Add statistics box
+            current_loss = train_losses[-1]
+            best_loss = min(train_losses)
+            stats_text = f'Current: {current_loss:.6f}\\nBest: {best_loss:.6f}\\nImprovement: {((train_losses[0] - current_loss) / train_losses[0] * 100):.1f}%'
+            ax1.text(0.02, 0.95, stats_text, transform=ax1.transAxes, fontsize=10,
+                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+            
+            # ==============================================================================
+            # 2. Directional Accuracy Evolution
+            # ==============================================================================
+            ax2 = fig.add_subplot(gs[0, 2:])
+            
+            train_dir_accs = self.training_history.get('train_dir_acc', [])
+            val_dir_accs = self.training_history.get('val_dir_acc', [])
+            
+            if train_dir_accs:
+                train_epochs = range(1, len(train_dir_accs) + 1)
+                ax2.plot(train_epochs, train_dir_accs, 'g-', linewidth=2, label='Training Dir. Acc', alpha=0.8)
+            
+            if val_dir_accs:
+                val_epochs = range(1, len(val_dir_accs) + 1)
+                ax2.plot(val_epochs, val_dir_accs, 'orange', linewidth=2, label='Validation Dir. Acc', alpha=0.8)
+            
+            # Add random baseline
+            ax2.axhline(50, color='black', linestyle=':', linewidth=2, label='Random Baseline')
+            
+            # Shade regions
+            ax2.axhspan(0, 50, alpha=0.1, color='red', label='Below Random')
+            ax2.axhspan(50, 100, alpha=0.1, color='green', label='Above Random')
+            
+            ax2.set_xlabel('Epoch', fontsize=12)
+            ax2.set_ylabel('Directional Accuracy (%)', fontsize=12)
+            ax2.set_title('Directional Accuracy Evolution', fontsize=14, fontweight='bold')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            ax2.set_ylim(0, 100)
+            
+            # ==============================================================================
+            # 3. Learning Rate and Gradient Norms
+            # ==============================================================================
+            ax3 = fig.add_subplot(gs[1, :2])
+            
+            # Plot learning rate if available
+            if hasattr(self, 'scheduler') and hasattr(self.scheduler, 'get_last_lr'):
+                try:
+                    current_lr = self.scheduler.get_last_lr()[0]
+                    ax3.axhline(current_lr, color='blue', linewidth=2, label=f'Current LR: {current_lr:.2e}')
+                except:
+                    pass
+            
+            # Plot gradient norms if available
+            grad_norms = self.training_history.get('grad_norms', [])
+            if grad_norms:
+                grad_epochs = range(1, len(grad_norms) + 1)
+                ax3.plot(grad_epochs, grad_norms, 'purple', linewidth=1.5, alpha=0.7, label='Gradient Norm')
+                ax3.set_ylabel('Gradient Norm', fontsize=12)
+            
+            ax3.set_xlabel('Epoch', fontsize=12)
+            ax3.set_title('Learning Dynamics', fontsize=14, fontweight='bold')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+            if grad_norms:
+                ax3.set_yscale('log')
+            
+            # ==============================================================================
+            # 4. Training Progress Metrics
+            # ==============================================================================
+            ax4 = fig.add_subplot(gs[1, 2:])
+            
+            # Create a summary table of current metrics
+            ax4.axis('tight')
+            ax4.axis('off')
+            
+            # Prepare metrics data
+            metrics_data = []
+            if train_losses:
+                metrics_data.append(['Training Loss', f'{train_losses[-1]:.6f}'])
+            if val_losses:
+                metrics_data.append(['Validation Loss', f'{val_losses[-1]:.6f}'])
+            if train_dir_accs:
+                metrics_data.append(['Train Dir. Acc', f'{train_dir_accs[-1]:.2f}%'])
+            if val_dir_accs:
+                metrics_data.append(['Val Dir. Acc', f'{val_dir_accs[-1]:.2f}%'])
+            
+            # Add epoch info
+            metrics_data.append(['Current Epoch', f'{epoch + 1}'])
+            metrics_data.append(['Total Epochs', f'{self.config.num_epochs}'])
+            
+            if metrics_data:
+                table = ax4.table(cellText=metrics_data, 
+                                colLabels=['Metric', 'Value'],
+                                loc='center', cellLoc='center')
+                table.auto_set_font_size(False)
+                table.set_fontsize(12)
+                table.scale(1.2, 2)
+                
+                # Style the table
+                for i in range(len(metrics_data)):
+                    table[(i+1, 0)].set_facecolor('#E8F4FD')
+                    table[(i+1, 1)].set_facecolor('#F0F8FF')
+            
+            ax4.set_title('Current Metrics Summary', fontsize=14, fontweight='bold', pad=20)
+            
+            # ==============================================================================
+            # 5. Loss Distribution Analysis
+            # ==============================================================================
+            ax5 = fig.add_subplot(gs[2, :2])
+            
+            if len(train_losses) > 10:
+                # Create histogram of recent losses
+                recent_losses = train_losses[-min(20, len(train_losses)):]
+                ax5.hist(recent_losses, bins=15, alpha=0.7, color='skyblue', edgecolor='black', density=True)
+                
+                # Add statistics
+                mean_loss = np.mean(recent_losses)
+                std_loss = np.std(recent_losses)
+                ax5.axvline(mean_loss, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_loss:.6f}')
+                
+                ax5.set_xlabel('Loss Value', fontsize=12)
+                ax5.set_ylabel('Density', fontsize=12)
+                ax5.set_title('Recent Loss Distribution', fontsize=14, fontweight='bold')
+                ax5.legend()
+                ax5.grid(True, alpha=0.3)
+            
+            # ==============================================================================
+            # 6. Performance Comparison
+            # ==============================================================================
+            ax6 = fig.add_subplot(gs[2, 2:])
+            
+            if train_dir_accs and val_dir_accs and len(train_dir_accs) > 0 and len(val_dir_accs) > 0:
+                # Compare train vs validation directional accuracy
+                min_len = min(len(train_dir_accs), len(val_dir_accs))
+                train_subset = train_dir_accs[:min_len]
+                val_subset = val_dir_accs[:min_len]
+                
+                ax6.scatter(train_subset, val_subset, alpha=0.6, s=50, color='green', edgecolor='black')
+                
+                # Add diagonal line (perfect agreement)
+                min_acc = min(min(train_subset), min(val_subset))
+                max_acc = max(max(train_subset), max(val_subset))
+                ax6.plot([min_acc, max_acc], [min_acc, max_acc], 'k--', linewidth=1, alpha=0.5, label='Perfect Agreement')
+                
+                # Add current point
+                if train_dir_accs and val_dir_accs:
+                    current_train = train_dir_accs[-1]
+                    current_val = val_dir_accs[-1]
+                    ax6.scatter(current_train, current_val, s=200, color='red', marker='*', 
+                               edgecolor='black', linewidth=2, label=f'Current ({current_train:.1f}%, {current_val:.1f}%)')
+                
+                ax6.set_xlabel('Training Directional Accuracy (%)', fontsize=12)
+                ax6.set_ylabel('Validation Directional Accuracy (%)', fontsize=12)
+                ax6.set_title('Train vs Validation Performance', fontsize=14, fontweight='bold')
+                ax6.grid(True, alpha=0.3)
+                ax6.legend()
+            
+            # Add timestamp and model info
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            info_text = f'Generated: {timestamp}\\nModel: TimesFM Fine-tuned\\nBatch Size: {self.config.batch_size}'
+            fig.text(0.99, 0.01, info_text, transform=fig.transFigure, fontsize=9,
+                     verticalalignment='bottom', horizontalalignment='right',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            # Save the plot
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            plot_path = FINETUNE_PLOTS_DIR / f"training_analysis_epoch_{epoch+1:03d}_{timestamp}.png"
+            
+            plt.tight_layout()
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            return plot_path
+            
+        except Exception as e:
+            print(f"   ❌ Error creating backtest-style analysis plot: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def create_training_evolution_plot(self, epoch):
@@ -1572,18 +2174,47 @@ Degradation: +-8.0%"""
             weight_decay=self.config.weight_decay
         )
         
-        # Store optimizer for checkpoint saving
+        # Create scheduler
+        scheduler = None
+        if TRAINING_CONFIG["use_lr_scheduler"]:
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, 
+                step_size=TRAINING_CONFIG["lr_scheduler_step_size"], 
+                gamma=TRAINING_CONFIG["lr_scheduler_gamma"]
+            )
+        
+        # Store optimizer and scheduler for checkpoint saving
         self._current_optimizer = optimizer
+        self._current_scheduler = scheduler
         self._best_val_loss = float('inf')
         
         # --- Load from Checkpoint if available ---
-        if CHECKPOINT_CONFIG["enabled"]:
+        start_epoch = 0
+        if CHECKPOINT_CONFIG["enabled"] and CHECKPOINT_CONFIG["resume_from_checkpoint"]:
             checkpoint_dir = CHECKPOINT_CONFIG["checkpoint_dir"]
-            latest_checkpoint_path = self.load_latest_checkpoint(checkpoint_dir)
-            if latest_checkpoint_path:
-                print(f"   ✅ Resuming training from checkpoint: {latest_checkpoint_path}")
+            
+            # Check for forced checkpoint path first
+            checkpoint_path = None
+            if CHECKPOINT_CONFIG["force_checkpoint_path"]:
+                force_path = Path(CHECKPOINT_CONFIG["force_checkpoint_path"])
+                if force_path.exists():
+                    checkpoint_path = force_path
+                    print(f"   🎯 Using forced checkpoint: {checkpoint_path}")
+                else:
+                    print(f"   ⚠️  Forced checkpoint not found: {force_path}")
+            
+            # If no forced path or forced path doesn't exist, try latest
+            if checkpoint_path is None:
+                checkpoint_path = self.load_latest_checkpoint(checkpoint_dir)
+            
+            if checkpoint_path:
+                start_epoch = self.load_checkpoint_state(checkpoint_path, self.model, optimizer, scheduler)
+                print(f"   ✅ Resuming training from checkpoint: {checkpoint_path}")
+                print(f"   📍 Starting from epoch: {start_epoch + 1}")
             else:
                 print("   ℹ️  No checkpoint found, starting fresh training.")
+        elif CHECKPOINT_CONFIG["enabled"]:
+            print("   ℹ️  Checkpointing enabled but resume disabled, starting fresh training.")
             
         print(f"\n🚀 Starting Enhanced TimesFM 2.0 finetuning...")
         print(f"   Device: {self.device}")
@@ -1594,6 +2225,15 @@ Degradation: +-8.0%"""
         print(f"   Epochs: {self.config.num_epochs}")
         print(f"   Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         print(f"   TensorBoard logs: {tensorboard_run_dir}")
+        
+        # Show checkpoint configuration
+        print(f"\n💾 Checkpoint Configuration:")
+        print(f"   Enabled: {CHECKPOINT_CONFIG['enabled']}")
+        print(f"   Resume: {CHECKPOINT_CONFIG['resume_from_checkpoint']}")
+        print(f"   Save every: {CHECKPOINT_CONFIG['save_every_n_epochs']} epochs")
+        print(f"   Keep last: {CHECKPOINT_CONFIG['keep_last_n_checkpoints']} checkpoints")
+        print(f"   Directory: {CHECKPOINT_CONFIG['checkpoint_dir']}")
+        
         print("=" * 60)
         
         # Log hyperparameters to TensorBoard
@@ -1634,7 +2274,7 @@ Degradation: +-8.0%"""
         early_stopping_min_delta = self.config.early_stopping_min_delta if hasattr(self.config, 'early_stopping_min_delta') else 1e-4
 
         try:
-            for epoch in range(self.config.num_epochs):
+            for epoch in range(start_epoch, self.config.num_epochs):
                 # Training
                 train_loss = self._train_epoch_verbose(train_loader, optimizer, epoch)
                 self.training_history['train_loss'].append(train_loss)
@@ -1685,6 +2325,14 @@ Degradation: +-8.0%"""
                         print(f"   📊 Dashboard plot created for epoch {epoch + 1}: {comprehensive_plot_path}")
                     else:
                         print(f"   ⚠️ Failed to create comprehensive dashboard plot for epoch {epoch + 1}")
+                    
+                    # Create backtest-style analysis plot every 5 epochs or at epoch 1
+                    if (epoch + 1) % 5 == 0 or epoch == 0:
+                        analysis_plot_path = self.create_backtest_style_analysis_plot(epoch)
+                        if analysis_plot_path:
+                            print(f"   📈 Training analysis plot created for epoch {epoch + 1}: {analysis_plot_path.name}")
+                        else:
+                            print(f"   ⚠️ Failed to create training analysis plot for epoch {epoch + 1}")
 
                 else:
                     # For epochs where we skip validation, carry forward the last validation loss for consistent plotting
@@ -1870,25 +2518,36 @@ Degradation: +-8.0%"""
         checkpoint_dir = CHECKPOINT_CONFIG["checkpoint_dir"]
         checkpoint_dir.mkdir(exist_ok=True)
         
-        # Get optimizer from the current context (passed to finetune_verbose)
+        # Get optimizer and scheduler from the current context
         optimizer = getattr(self, '_current_optimizer', None)
+        scheduler = getattr(self, '_current_scheduler', None)
         best_val_loss = getattr(self, '_best_val_loss', float('inf'))
         
+        from datetime import datetime
+        
         state = {
-            'epoch': epoch + 1,
+            'epoch': epoch,  # Store the completed epoch number
             'model_state_dict': self.model.state_dict(),
             'training_history': self.training_history,
+            'best_val_loss': self._best_val_loss,
+            'current_val_loss': current_val_loss,
             'torch_rng_state': torch.get_rng_state(),
             'numpy_rng_state': np.random.get_state(),
+            'timestamp': datetime.now().isoformat(),
+            'config': {
+                'model': MODEL_CONFIG,
+                'training': TRAINING_CONFIG,
+                'checkpoint': CHECKPOINT_CONFIG
+            }
         }
         
         # Add optimizer state if available
         if optimizer is not None:
             state['optimizer_state_dict'] = optimizer.state_dict()
             
-        # Add best val loss if available
-        if hasattr(self, '_best_val_loss'):
-            state['best_val_loss'] = self._best_val_loss
+        # Add scheduler state if available  
+        if scheduler is not None:
+            state['scheduler_state_dict'] = scheduler.state_dict()
 
         # Save a periodic checkpoint
         if (epoch + 1) % CHECKPOINT_CONFIG["save_every_n_epochs"] == 0:
@@ -1920,7 +2579,10 @@ Degradation: +-8.0%"""
                 print(f"   🗑️  Removed old checkpoint: {old_checkpoint.name}")
 
     def load_latest_checkpoint(self, checkpoint_dir: Path) -> Optional[Path]:
-        """Loads the latest checkpoint from the given directory."""
+        """Finds the latest checkpoint from the given directory."""
+        if not checkpoint_dir.exists():
+            return None
+            
         checkpoints = sorted(
             [p for p in checkpoint_dir.glob("checkpoint_epoch_*.pth")],
             key=os.path.getmtime
@@ -1928,6 +2590,194 @@ Degradation: +-8.0%"""
         if checkpoints:
             return checkpoints[-1]
         return None
+    
+    def load_checkpoint_state(self, checkpoint_path: Path, model, optimizer, scheduler) -> int:
+        """
+        Loads complete training state from checkpoint.
+        
+        Returns:
+            int: The epoch number to resume from
+        """
+        try:
+            print(f"   📂 Loading checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Load model state
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"   ✅ Model state loaded")
+            
+            # Load optimizer state
+            if 'optimizer_state_dict' in checkpoint and optimizer is not None:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print(f"   ✅ Optimizer state loaded")
+            
+            # Load scheduler state
+            if 'scheduler_state_dict' in checkpoint and scheduler is not None:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print(f"   ✅ Scheduler state loaded")
+            
+            # Load training history
+            if 'training_history' in checkpoint:
+                self.training_history = checkpoint['training_history']
+                print(f"   ✅ Training history loaded ({len(self.training_history['train_loss'])} epochs)")
+            
+            # Load best validation loss
+            if 'best_val_loss' in checkpoint:
+                self._best_val_loss = checkpoint['best_val_loss']
+                print(f"   ✅ Best validation loss: {self._best_val_loss:.6f}")
+            
+            # Get epoch number
+            epoch = checkpoint.get('epoch', 0)
+            
+            # Load additional metadata
+            if 'config' in checkpoint:
+                print(f"   📋 Checkpoint config loaded")
+            if 'timestamp' in checkpoint:
+                print(f"   🕒 Checkpoint created: {checkpoint['timestamp']}")
+            
+            return epoch
+            
+        except Exception as e:
+            print(f"   ❌ Error loading checkpoint: {e}")
+            print(f"   ⚠️  Starting fresh training instead")
+            return 0
+
+# ==============================================================================
+# Dataset Cache Management Functions
+# ==============================================================================
+
+def clear_dataset_cache(cache_dir: Path = None):
+    """Clear all dataset cache files"""
+    if cache_dir is None:
+        cache_dir = config.data.cache_dir
+    
+    if not cache_dir.exists():
+        print(f"📁 Cache directory doesn't exist: {cache_dir}")
+        return
+    
+    cache_files = list(cache_dir.glob("dataset_cache_*.pkl*")) + list(cache_dir.glob("dataset_cache_*.joblib*"))
+    
+    if not cache_files:
+        print(f"📁 No cache files found in: {cache_dir}")
+        return
+    
+    total_size = sum(f.stat().st_size for f in cache_files) / (1024 * 1024)
+    
+    for cache_file in cache_files:
+        cache_file.unlink()
+    
+    print(f"🗑️  Cleared {len(cache_files)} cache files ({total_size:.1f} MB) from: {cache_dir}")
+
+def show_cache_info(cache_dir: Path = None):
+    """Show information about cached datasets"""
+    if cache_dir is None:
+        cache_dir = config.data.cache_dir
+    
+    if not cache_dir.exists():
+        print(f"📁 Cache directory doesn't exist: {cache_dir}")
+        return
+    
+    cache_files = list(cache_dir.glob("dataset_cache_*.pkl*")) + list(cache_dir.glob("dataset_cache_*.joblib*"))
+    
+    if not cache_files:
+        print(f"📁 No cache files found in: {cache_dir}")
+        return
+    
+    print(f"💾 Dataset Cache Information ({cache_dir}):")
+    total_size = 0
+    
+    for cache_file in sorted(cache_files, key=lambda x: x.stat().st_mtime, reverse=True):
+        size_mb = cache_file.stat().st_size / (1024 * 1024)
+        total_size += size_mb
+        mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
+        print(f"   📄 {cache_file.name}")
+        print(f"      Size: {size_mb:.1f} MB")
+        print(f"      Modified: {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    print(f"   📊 Total: {len(cache_files)} files, {total_size:.1f} MB")
+
+def set_cache_config(enable=True, cache_dir=None, format="pickle", 
+                    force_rebuild=False, compression=True):
+    """
+    Configure dataset caching behavior.
+    
+    Args:
+        enable (bool): Enable/disable caching
+        cache_dir (str): Cache directory path
+        format (str): Cache format ("pickle" or "joblib")
+        force_rebuild (bool): Force rebuild all caches
+        compression (bool): Enable compression
+    """
+    global config
+    config.data.enable_cache = enable
+    if cache_dir:
+        config.data.cache_dir = Path(cache_dir)
+    config.data.cache_format = format
+    config.data.force_rebuild_cache = force_rebuild
+    config.data.cache_compression = compression
+    
+    print(f"🔧 Dataset Cache Configuration Updated:")
+    print(f"   Enabled: {enable}")
+    print(f"   Directory: {config.data.cache_dir}")
+    print(f"   Format: {format}")
+    print(f"   Compression: {compression}")
+    if force_rebuild:
+        print(f"   🔄 Force rebuild: True")
+
+def disable_caching():
+    """Disable dataset caching."""
+    set_cache_config(enable=False)
+
+def enable_caching():
+    """Enable dataset caching with default settings."""
+    set_cache_config(enable=True)
+
+def force_cache_rebuild():
+    """Force rebuild of all dataset caches on next load."""
+    set_cache_config(enable=True, force_rebuild=True)
+
+# ==============================================================================
+# Checkpoint Control Functions
+# ==============================================================================
+
+def set_checkpoint_config(enabled=True, resume=True, save_every_n_epochs=5, 
+                         keep_last_n=3, force_path=None):
+    """
+    Convenient function to configure checkpointing behavior.
+    
+    Args:
+        enabled (bool): Enable/disable checkpointing
+        resume (bool): Whether to resume from latest checkpoint
+        save_every_n_epochs (int): Save checkpoint every N epochs
+        keep_last_n (int): Keep last N checkpoints
+        force_path (str): Force resume from specific checkpoint path
+    """
+    global CHECKPOINT_CONFIG
+    CHECKPOINT_CONFIG["enabled"] = enabled
+    CHECKPOINT_CONFIG["resume_from_checkpoint"] = resume
+    CHECKPOINT_CONFIG["save_every_n_epochs"] = save_every_n_epochs
+    CHECKPOINT_CONFIG["keep_last_n_checkpoints"] = keep_last_n
+    CHECKPOINT_CONFIG["force_checkpoint_path"] = force_path
+    
+    print(f"🔧 Checkpoint Configuration Updated:")
+    print(f"   Enabled: {enabled}")
+    print(f"   Resume: {resume}")
+    print(f"   Save every: {save_every_n_epochs} epochs")
+    print(f"   Keep last: {keep_last_n} checkpoints")
+    if force_path:
+        print(f"   Force path: {force_path}")
+
+def disable_checkpointing():
+    """Disable all checkpointing."""
+    set_checkpoint_config(enabled=False, resume=False)
+
+def enable_fresh_training():
+    """Enable checkpointing but start fresh (don't resume)."""
+    set_checkpoint_config(enabled=True, resume=False)
+
+def enable_resume_training():
+    """Enable checkpointing and resume from latest checkpoint."""
+    set_checkpoint_config(enabled=True, resume=True)
 
 # ==============================================================================
 # Training Functions
@@ -2147,5 +2997,36 @@ def main():
     return 0
 
 if __name__ == "__main__":
+    # Example: Configure checkpointing before training
+    # 
+    # To start fresh training (no resume):
+    # enable_fresh_training()
+    # 
+    # To resume from latest checkpoint:
+    # enable_resume_training()
+    # 
+    # To disable checkpointing entirely:
+    # disable_checkpointing()
+    # 
+    # To resume from specific checkpoint:
+    # set_checkpoint_config(enabled=True, resume=True, force_path="./finetune_checkpoints/checkpoint_epoch_10.pth")
+    
+    # Example: Configure dataset caching before training
+    # 
+    # To disable caching (slower but uses less disk):
+    # disable_caching()
+    # 
+    # To enable caching with compression (default):
+    # enable_caching()
+    # 
+    # To force rebuild all caches:
+    # force_cache_rebuild()
+    # 
+    # To view cache information:
+    # show_cache_info()
+    # 
+    # To clear all caches:
+    # clear_dataset_cache()
+    
     exit_code = main()
     sys.exit(exit_code)

@@ -1,0 +1,65 @@
+{
+  "model_config": {
+    "repo_id": "google/timesfm-2.0-500m-pytorch",
+    "context_len": 2048,
+    "horizon_len": 128,
+    "num_layers": 50,
+    "per_core_batch_size": 16,
+    "use_positional_embedding": false
+  },
+  "training_config": {
+    "batch_size": 64,
+    "num_epochs": 500,
+    "learning_rate": 5e-05,
+    "weight_decay": 0.01,
+    "freq_type": 0,
+    "use_quantile_loss": true,
+    "log_every_n_steps": 10,
+    "val_check_interval": 0.5,
+    "validate_every_n_epochs": 1,
+    "use_wandb": false,
+    "wandb_project": "timesfm2-es-futures",
+    "gradient_clip_norm": 1.0,
+    "early_stopping_patience": 20,
+    "early_stopping_min_delta": 0.0001,
+    "use_lr_scheduler": true,
+    "lr_scheduler_gamma": 0.95,
+    "lr_scheduler_step_size": 50
+  },
+  "split_config": {
+    "train_end_date": "2020-12-31",
+    "val_end_date": "2022-12-31",
+    "test_start_date": "2023-01-01",
+    "context_minutes": 416,
+    "prediction_minutes": 96
+  },
+  "training_results": {
+    "history": {
+      "train_loss": [
+        0.0036296742036938667
+      ],
+      "val_loss": [
+        0.0013245036825537682
+      ],
+      "epoch_times": [
+        0.6910090446472168
+      ],
+      "batch_times": [
+        0.566603422164917
+      ]
+    },
+    "best_val_loss": 0.0013245036825537682,
+    "best_epoch": 0,
+    "total_time": 12.436820268630981,
+    "final_plot": "/workspace/stonkz_new/finetune_plots/training_progress_20250830_194047.png",
+    "tensorboard_dir": "/workspace/stonkz_new/tensorboard_logs/timesfm_run_20250830_194035",
+    "test_metrics": {
+      "test_loss": 1.9439462448644917e-06,
+      "mse": "1.9439462e-06",
+      "mae": "0.0010501307",
+      "directional_accuracy": 0.2952755905511811,
+      "num_samples": 2
+    }
+  },
+  "timestamp": "2025-08-30T19:40:56.560430"
+}

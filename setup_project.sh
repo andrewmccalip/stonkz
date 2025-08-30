@@ -134,6 +134,20 @@ else
 fi
 
 # ==============================================================================
+# Vast.ai Configuration (Disable Tmux)
+# ==============================================================================
+
+print_step "Configuring Vast.ai settings..."
+
+# Disable automatic tmux session on Vast.ai
+if [ ! -f ~/.no_auto_tmux ]; then
+    touch ~/.no_auto_tmux
+    print_success "Disabled automatic tmux session on Vast.ai"
+else
+    print_success "Vast.ai tmux already disabled"
+fi
+
+# ==============================================================================
 # Git Configuration
 # ==============================================================================
 
