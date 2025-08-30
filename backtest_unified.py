@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import random
+import signal
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Callable
@@ -44,8 +45,8 @@ sys.path.append(str(SCRIPT_DIR))
 
 # Import prediction models
 # from prediction_sundial import predict_sundial, get_model_info as get_sundial_info
-# Future imports can be added here:
 from prediction_timesfm_v2 import predict_timesfm_v2, get_model_info as get_timesfm_info
+from prediction_fft import predict_fft, get_model_info as get_fft_info
 # from prediction_chronos import predict_chronos, get_model_info as get_chronos_info
 
 # ==============================================================================
@@ -53,7 +54,7 @@ from prediction_timesfm_v2 import predict_timesfm_v2, get_model_info as get_time
 # ==============================================================================
 
 # Backtesting parameters
-NUM_TEST_CASES = 150           # Number of test cases to run
+NUM_TEST_CASES = 2000           # Number of test cases to run
 CONTEXT_LENGTH = 416           # Historical context in minutes (~6.9 hours)
 HORIZON_LENGTH = 96            # Prediction horizon in minutes (~1.6 hours)
 RANDOM_SEED = 42              # For reproducibility
@@ -71,12 +72,17 @@ MODEL_REGISTRY = {
     #     'display_name': 'Sundial Base 128M',
     #     'color': '#FF6B6B'
     # },
-    # Add more models as they become available:
     'timesfm_v2': {
         'predict_fn': predict_timesfm_v2,
         'info_fn': get_timesfm_info,
         'display_name': 'TimesFM 2.0',
         'color': '#4ECDC4'
+    },
+    'fft_similarity': {
+        'predict_fn': predict_fft,
+        'info_fn': get_fft_info,
+        'display_name': 'FFT Similarity Matching',
+        'color': '#9B59B6'
     },
 }
 
@@ -326,7 +332,7 @@ class BacktestEngine:
             }
     
     def run_backtest(self):
-        """Run the complete backtest."""
+        """Run the complete backtest with graceful keyboard interrupt handling."""
         print(f"\n🚀 Starting backtest for {self.model_config['display_name']}")
         print(f"   Model: {self.model_name}")
         print(f"   Test cases: {self.num_cases}")
@@ -337,13 +343,25 @@ class BacktestEngine:
         if not self.test_cases:
             self.select_test_cases()
         
-        # Run tests with progress bar
+        # Run tests with progress bar and keyboard interrupt handling
         print(f"\n📊 Running predictions...")
+        print(f"   💡 Press Ctrl+C to stop and analyze current progress")
         self.results = []
         
-        for test_case in tqdm(self.test_cases, desc="Processing"):
-            result = self.run_single_test(test_case)
-            self.results.append(result)
+        try:
+            for test_case in tqdm(self.test_cases, desc="Processing"):
+                result = self.run_single_test(test_case)
+                self.results.append(result)
+        except KeyboardInterrupt:
+            print(f"\n\n⚠️  Keyboard interrupt detected!")
+            print(f"   📊 Stopping analysis and processing current results...")
+            print(f"   🔢 Completed {len(self.results)} out of {len(self.test_cases)} test cases")
+            
+            if len(self.results) == 0:
+                print(f"   ❌ No test cases completed - cannot generate analysis")
+                return
+            
+            print(f"   ✅ Proceeding with analysis of {len(self.results)} completed cases...")
         
         # Calculate summary statistics
         self.calculate_summary()
@@ -1145,7 +1163,7 @@ def run_backtest(model_name: str = 'sundial', num_cases: int = NUM_TEST_CASES,
                  plot_results: bool = True, save_results: bool = True,
                  comprehensive_plots: bool = True):
     """
-    Run a complete backtest for a specified model.
+    Run a complete backtest for a specified model with graceful interrupt handling.
     
     Args:
         model_name: Name of the model to test
@@ -1160,17 +1178,22 @@ def run_backtest(model_name: str = 'sundial', num_cases: int = NUM_TEST_CASES,
     # Create backtest engine
     engine = BacktestEngine(model_name, num_cases)
     
-    # Run backtest
-    engine.run_backtest()
-    
-    # Save results
-    if save_results:
-        engine.save_results()
-    
-    # Generate plots
-    if plot_results:
-        engine.plot_results(save_plots=save_results, comprehensive=comprehensive_plots)
-    
+    try:
+        # Run backtest
+        engine.run_backtest()
+        
+        # Save results if we have any
+        if save_results and len(engine.results) > 0:
+            engine.save_results()
+        
+        # Generate plots if we have any successful results
+        if plot_results and len([r for r in engine.results if r['success']]) > 0:
+            engine.plot_results(save_plots=save_results, comprehensive=comprehensive_plots)
+            
+    except KeyboardInterrupt:
+        # This shouldn't happen since we handle it in run_backtest, but just in case
+        print(f"\n⚠️  Interrupt detected at top level - exiting gracefully...")
+        
     return engine
 
 # ==============================================================================
@@ -1202,17 +1225,23 @@ if __name__ == "__main__":
     print("🎯 Unified Backtest Framework for Time Series Predictions")
     print("=" * 60)
     
-    if args.compare:
-        # Compare multiple models
-        compare_models(args.compare, args.cases)
-    else:
-        # Run single model backtest
-        run_backtest(
-            model_name=args.model,
-            num_cases=args.cases,
-            plot_results=not args.no_plots,
-            save_results=not args.no_save,
-            comprehensive_plots=not args.simple_plots
-        )
-    
-    print("\n✅ Backtest complete!")
+    try:
+        if args.compare:
+            # Compare multiple models
+            compare_models(args.compare, args.cases)
+        else:
+            # Run single model backtest
+            run_backtest(
+                model_name=args.model,
+                num_cases=args.cases,
+                plot_results=not args.no_plots,
+                save_results=not args.no_save,
+                comprehensive_plots=not args.simple_plots
+            )
+        
+        print("\n✅ Backtest complete!")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Final keyboard interrupt - exiting...")
+        print("✅ Results from completed test cases have been processed and saved.")
+        sys.exit(0)

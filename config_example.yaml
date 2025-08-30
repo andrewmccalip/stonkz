@@ -1,0 +1,46 @@
+# Example TimesFM Fine-tuning Configuration
+experiment_name: "timesfm_es_finetune_v2"
+output_dir: "./experiments"
+
+model:
+  repo_id: "google/timesfm-2.0-500m-pytorch"
+  context_len: 2048
+  horizon_len: 128
+  num_layers: 50
+  per_core_batch_size: 16
+  use_positional_embedding: false
+
+training:
+  batch_size: 32
+  num_epochs: 500
+  learning_rate: 1e-5
+  weight_decay: 0.01
+  freq_type: 0
+  use_quantile_loss: true
+  log_every_n_steps: 10
+  val_check_interval: 0.5
+  validate_every_n_epochs: 1
+  use_wandb: false
+  wandb_project: "timesfm2-es-futures"
+  gradient_clip_norm: 1.0
+  early_stopping_patience: 20
+  early_stopping_min_delta: 1e-4
+
+data:
+  train_end_date: "2020-12-31"
+  val_end_date: "2022-12-31"
+  test_start_date: "2023-01-01"
+  context_minutes: 416
+  prediction_minutes: 96
+  use_sample: true
+  total_sequences: 1000000
+  train_ratio: 0.7
+  val_ratio: 0.2
+  test_ratio: 0.1
+  random_seed: 42
+
+checkpoint:
+  enabled: false
+  save_every_n_epochs: 10
+  keep_last_n_checkpoints: 3
+  save_best_only: false

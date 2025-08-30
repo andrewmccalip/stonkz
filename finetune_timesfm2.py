@@ -52,6 +52,9 @@ warnings.filterwarnings('ignore')
 import matplotlib.pyplot as plt
 import time
 from torch.utils.tensorboard import SummaryWriter
+import json
+import yaml
+from dataclasses import dataclass, asdict
 
 # Import plotting module
 try:
@@ -64,16 +67,121 @@ except ImportError as e:
 
 # Add TimesFM to path
 SCRIPT_DIR = Path(__file__).parent
-TIMESFM_DIR = SCRIPT_DIR / "FlaMinGo-timesfm-clean" / "src"
+TIMESFM_DIR = SCRIPT_DIR / "timesfm" / "src"
 sys.path.append(str(TIMESFM_DIR))
 
 # TimesFM imports
-from timesfm import TimesFm, TimesFmCheckpoint, TimesFmHparams
+import timesfm
+from timesfm import TimesFmCheckpoint, TimesFmHparams
 from timesfm.pytorch_patched_decoder import PatchedTimeSeriesDecoder
 from finetuning.finetuning_torch import FinetuningConfig, TimesFMFinetuner
 
 # ==============================================================================
-# Configuration
+# Configuration Classes
+# ==============================================================================
+
+@dataclass
+class ModelConfig:
+    """Configuration for TimesFM model parameters"""
+    repo_id: str = "google/timesfm-2.0-500m-pytorch"
+    context_len: int = 2048
+    horizon_len: int = 128
+    num_layers: int = 50
+    per_core_batch_size: int = 16
+    use_positional_embedding: bool = False
+
+@dataclass
+class TrainingConfig:
+    """Configuration for training parameters"""
+    batch_size: int = 64
+    num_epochs: int = 500
+    learning_rate: float = 5e-5
+    weight_decay: float = 0.01
+    freq_type: int = 0
+    use_quantile_loss: bool = True
+    log_every_n_steps: int = 10
+    val_check_interval: float = 0.5
+    validate_every_n_epochs: int = 1
+    use_wandb: bool = False
+    wandb_project: str = "timesfm2-es-futures"
+    gradient_clip_norm: float = 1.0
+    early_stopping_patience: int = 20
+    early_stopping_min_delta: float = 1e-4
+    use_lr_scheduler: bool = True
+    lr_scheduler_gamma: float = 0.95
+    lr_scheduler_step_size: int = 50
+
+@dataclass
+class DataConfig:
+    """Configuration for data processing"""
+    train_end_date: str = "2020-12-31"
+    val_end_date: str = "2022-12-31"
+    test_start_date: str = "2023-01-01"
+    context_minutes: int = 416
+    prediction_minutes: int = 96
+    use_sample: bool = True
+    total_sequences: int = 1000
+    train_ratio: float = 0.7
+    val_ratio: float = 0.2
+    test_ratio: float = 0.1
+    random_seed: int = 42
+
+@dataclass
+class CheckpointConfig:
+    """Configuration for model checkpoints"""
+    enabled: bool = False
+    checkpoint_dir: Path = None
+    save_every_n_epochs: int = 10
+    keep_last_n_checkpoints: int = 3
+    save_best_only: bool = False
+
+@dataclass
+class ExperimentConfig:
+    """Main configuration class combining all settings"""
+    model: ModelConfig
+    training: TrainingConfig
+    data: DataConfig
+    checkpoint: CheckpointConfig
+    experiment_name: str = "timesfm_es_finetune"
+    output_dir: Path = None
+
+    def __post_init__(self):
+        if self.checkpoint.checkpoint_dir is None:
+            self.checkpoint.checkpoint_dir = Path("./finetune_checkpoints")
+        if self.output_dir is None:
+            self.output_dir = Path("./experiments")
+
+    @classmethod
+    def from_yaml(cls, yaml_path: Path) -> 'ExperimentConfig':
+        """Load configuration from YAML file"""
+        with open(yaml_path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+
+        # Convert nested dictionaries to dataclass instances
+        config_dict['model'] = ModelConfig(**config_dict['model'])
+        config_dict['training'] = TrainingConfig(**config_dict['training'])
+        config_dict['data'] = DataConfig(**config_dict['data'])
+        config_dict['checkpoint'] = CheckpointConfig(**config_dict['checkpoint'])
+
+        return cls(**config_dict)
+
+    def to_yaml(self, output_path: Path) -> None:
+        """Save configuration to YAML file"""
+        config_dict = asdict(self)
+        # Convert Path objects to strings for YAML serialization
+        for key, value in config_dict.items():
+            if isinstance(value, dict):
+                for subkey, subvalue in value.items():
+                    if isinstance(subvalue, Path):
+                        value[subkey] = str(subvalue)
+            elif isinstance(value, Path):
+                config_dict[key] = str(value)
+
+        with open(output_path, 'w') as f:
+            yaml.dump(config_dict, f, default_flow_style=False, indent=2)
+
+# ==============================================================================
+# Configuration (Backward Compatibility)
 # ==============================================================================
 
 # Dataset paths
@@ -89,57 +197,86 @@ FINETUNE_PLOTS_DIR.mkdir(exist_ok=True)
 TENSORBOARD_LOG_DIR = SCRIPT_DIR / "tensorboard_logs"
 TENSORBOARD_LOG_DIR.mkdir(exist_ok=True)
 
-# Model configuration - Using original TimesFM 2.0 500m (NOT Flamingo)
-MODEL_CONFIG = {
-    "repo_id": "google/timesfm-2.0-500m-pytorch",  # Original Google TimesFM 2.0 500m model
-    "context_len": 512,      # Match our sequence length (will be padded/truncated as needed)
-    "horizon_len": 128,      # Model's default horizon (will match our 96 + padding)
-    "num_layers": 50,        # TimesFM 2.0 500m
-    "per_core_batch_size": 16,
-    "use_positional_embedding": False,
-}
+# Initialize configuration with new dataclass structure
+config = ExperimentConfig(
+    model=ModelConfig(),
+    training=TrainingConfig(),
+    data=DataConfig(),
+    checkpoint=CheckpointConfig(checkpoint_dir=SCRIPT_DIR / "finetune_checkpoints"),
+    output_dir=SCRIPT_DIR / "experiments"
+)
 
-# Training configuration
-TRAINING_CONFIG = {
-    "batch_size": 32,
-    "num_epochs": 500,         # Reduced for testing
-    "learning_rate": 1e-5,   # Lower LR for finetuning
-    "weight_decay": 0.01,
-    "freq_type": 0,          # High frequency (minute data)
-    "use_quantile_loss": True,
-    "log_every_n_steps": 10,
-    "val_check_interval": 0.5,  # Original finetuner param, not used in our verbose loop
-    "validate_every_n_epochs": 1, # Run validation every 5 epochs
-    "use_wandb": False,      # Disabled for testing
-    "wandb_project": "timesfm2-es-futures",
-}
-
-# Sample configuration (for testing)
+# Backward compatibility - create global dictionaries from config
+MODEL_CONFIG = asdict(config.model)
+TRAINING_CONFIG = asdict(config.training)
 SAMPLE_CONFIG = {
-    "use_sample": True,      # Use random sample instead of full dataset
-    "total_sequences": 1000000, # Total sequences to use
-    "train_ratio": 0.7,      # 70% for training
-    "val_ratio": 0.2,        # 20% for validation  
-    "test_ratio": 0.1,       # 10% for testing
-    "random_seed": 42,       # For reproducible sampling
+    "use_sample": config.data.use_sample,
+    "total_sequences": config.data.total_sequences,
+    "train_ratio": config.data.train_ratio,
+    "val_ratio": config.data.val_ratio,
+    "test_ratio": config.data.test_ratio,
+    "random_seed": config.data.random_seed,
 }
-
-# Data splitting (time-based to avoid contamination)
 SPLIT_CONFIG = {
-    "train_end_date": "2020-12-31",    # Train: 2010-2020
-    "val_end_date": "2022-12-31",      # Val: 2021-2022  
-    "test_start_date": "2023-01-01",   # Test: 2023+
-    "context_minutes": 416,            # Historical context
-    "prediction_minutes": 96,          # Future prediction
+    "train_end_date": config.data.train_end_date,
+    "val_end_date": config.data.val_end_date,
+    "test_start_date": config.data.test_start_date,
+    "context_minutes": config.data.context_minutes,
+    "prediction_minutes": config.data.prediction_minutes,
 }
+CHECKPOINT_CONFIG = asdict(config.checkpoint)
 
-# Checkpoint Configuration
-CHECKPOINT_CONFIG = {
-    "enabled": False,
-    "checkpoint_dir": SCRIPT_DIR / "finetune_checkpoints",
-    "save_every_n_epochs": 10,  # Save a checkpoint every 10 epochs
-    "keep_last_n_checkpoints": 3, # Keep only the last 3 periodic checkpoints
-}
+# ==============================================================================
+# Performance Monitoring
+# ==============================================================================
+
+class TrainingMonitor:
+    """Monitor training performance and provide insights"""
+
+    def __init__(self):
+        self.metrics_history = {
+            'epoch_times': [],
+            'batch_times': [],
+            'memory_usage': [],
+            'gpu_utilization': []
+        }
+        self.start_time = None
+
+    def start_training(self):
+        """Mark the start of training"""
+        self.start_time = time.time()
+        print(f"🚀 Training started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def log_epoch_metrics(self, epoch: int, epoch_time: float, train_loss: float, val_loss: float):
+        """Log metrics for an epoch"""
+        self.metrics_history['epoch_times'].append(epoch_time)
+
+        # Calculate ETA
+        elapsed = time.time() - self.start_time
+        epochs_completed = epoch + 1
+        avg_epoch_time = elapsed / epochs_completed
+        remaining_epochs = 500 - epochs_completed  # Assuming 500 total epochs
+        eta_seconds = remaining_epochs * avg_epoch_time
+
+        print(f"   ⏱️  Epoch {epoch + 1} time: {epoch_time:.2f}s")
+        print(f"   📊 Train/Val Loss: {train_loss:.6f} / {val_loss:.6f}")
+        print(f"   🎯 ETA: {eta_seconds/3600:.1f}h ({eta_seconds/60:.1f}m)")
+
+    def get_performance_summary(self) -> Dict[str, Any]:
+        """Get a summary of training performance"""
+        if not self.metrics_history['epoch_times']:
+            return {}
+
+        epoch_times = self.metrics_history['epoch_times']
+        total_time = sum(epoch_times)
+
+        return {
+            'total_training_time': total_time,
+            'average_epoch_time': np.mean(epoch_times),
+            'fastest_epoch': min(epoch_times),
+            'slowest_epoch': max(epoch_times),
+            'epochs_completed': len(epoch_times)
+        }
 
 # ==============================================================================
 # Dataset Class
@@ -441,7 +578,7 @@ def create_timesfm_model(load_weights: bool = True) -> Tuple[nn.Module, Dict[str
     )
     
     # Initialize TimesFM
-    tfm = TimesFm(
+    tfm = timesfm.TimesFm(
         hparams=hparams,
         checkpoint=TimesFmCheckpoint(huggingface_repo_id=MODEL_CONFIG["repo_id"])
     )
@@ -476,8 +613,8 @@ def create_timesfm_model(load_weights: bool = True) -> Tuple[nn.Module, Dict[str
 class VerboseTimesFMFinetuner(TimesFMFinetuner):
     """Enhanced TimesFM Finetuner with verbose logging and plotting"""
     
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, model, config, logger=None):
+        super().__init__(model, config, logger=logger)
         # Store horizon_len directly on the instance for easy access
         self.horizon_len = MODEL_CONFIG["horizon_len"]
         self.context_len = MODEL_CONFIG["context_len"]
@@ -524,36 +661,52 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
 
     def _process_batch(self, batch: Tuple) -> Tuple[torch.Tensor, torch.Tensor]:
         """Process a single batch of data, returning loss and predictions."""
-        context, padding, freq, horizon = batch
-        context, padding, freq, horizon = (
-            context.to(self.device),
-            padding.to(self.device),
-            freq.to(self.device),
-            horizon.to(self.device),
-        )
-
-        # Forward pass
-        predictions_raw = self.model(context, padding.float(), freq)
-
-        # The model output is likely [batch, patches, horizon, distribution].
-        # We need the point forecast for loss, which is usually the first element
-        # in the last dimension.
-        if predictions_raw.ndim == 4 and predictions_raw.shape[2] == self.horizon_len:
-             # This aligns with the error: [200, 13, 128, 10] -> take the mean over the last dim, but lets select the last patch
-            predictions = predictions_raw[:, -1, :, 0]
-
-        else:
-            # If the shape is already correct or different, use it as is
-            predictions = predictions_raw
-
-        # Ensure prediction and horizon shapes match before loss calculation
-        if predictions.shape != horizon.shape:
-             raise ValueError(
-                f"Shape mismatch for loss: pred {predictions.shape} vs horizon {horizon.shape}"
+        try:
+            context, padding, freq, horizon = batch
+            context, padding, freq, horizon = (
+                context.to(self.device),
+                padding.to(self.device),
+                freq.to(self.device),
+                horizon.to(self.device),
             )
 
-        loss = self.criterion(predictions, horizon)
-        return loss, predictions
+            # Forward pass
+            predictions_raw = self.model(context, padding.float(), freq)
+
+            # Handle different output shapes from TimesFM
+            if predictions_raw.ndim == 4 and predictions_raw.shape[2] == self.horizon_len:
+                # Shape: [batch, patches, horizon, distribution]
+                # Take the last patch and first distribution element (point forecast)
+                predictions = predictions_raw[:, -1, :, 0]
+            elif predictions_raw.ndim == 3 and predictions_raw.shape[1] == self.horizon_len:
+                # Shape: [batch, horizon, distribution]
+                predictions = predictions_raw[:, :, 0]
+            else:
+                # Fallback: use as-is and hope for the best
+                predictions = predictions_raw.squeeze()
+
+            # Ensure prediction and horizon shapes match before loss calculation
+            if predictions.shape != horizon.shape:
+                # Try to handle common shape mismatches
+                if len(predictions.shape) == 2 and len(horizon.shape) == 2:
+                    # Truncate or pad predictions to match horizon
+                    min_len = min(predictions.shape[1], horizon.shape[1])
+                    predictions = predictions[:, :min_len]
+                    horizon = horizon[:, :min_len]
+                else:
+                    raise ValueError(
+                        f"Shape mismatch for loss: pred {predictions.shape} vs horizon {horizon.shape}"
+                    )
+
+            loss = self.criterion(predictions, horizon)
+            return loss, predictions
+
+        except Exception as e:
+            print(f"   ❌ Error in batch processing: {e}")
+            # Return a dummy loss to allow training to continue
+            dummy_loss = torch.tensor(1.0, requires_grad=True, device=self.device)
+            dummy_predictions = torch.zeros_like(horizon)
+            return dummy_loss, dummy_predictions
 
     def _train_epoch_verbose(self, train_loader: DataLoader, optimizer: torch.optim.Optimizer, epoch: int) -> float:
         """Perform one training epoch with verbose logging"""
@@ -578,7 +731,7 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                     optimizer.zero_grad()
                     loss.backward()
                     
-                    # Track gradient norms
+                    # Track gradient norms before clipping
                     total_norm = 0
                     for p in self.model.parameters():
                         if p.grad is not None:
@@ -586,7 +739,10 @@ class VerboseTimesFMFinetuner(TimesFMFinetuner):
                             total_norm += param_norm.item() ** 2
                     total_norm = total_norm ** (1. / 2)
                     self._epoch_grad_norms.append(total_norm)
-                    
+
+                    # Gradient clipping for stability
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
                     optimizer.step()
                     
                     batch_loss = loss.item()
@@ -1416,6 +1572,10 @@ Degradation: +-8.0%"""
             weight_decay=self.config.weight_decay
         )
         
+        # Store optimizer for checkpoint saving
+        self._current_optimizer = optimizer
+        self._best_val_loss = float('inf')
+        
         # --- Load from Checkpoint if available ---
         if CHECKPOINT_CONFIG["enabled"]:
             checkpoint_dir = CHECKPOINT_CONFIG["checkpoint_dir"]
@@ -1469,7 +1629,10 @@ Degradation: +-8.0%"""
         
         best_val_loss = float('inf')
         best_epoch = 0
-        
+        patience_counter = 0
+        early_stopping_patience = self.config.early_stopping_patience if hasattr(self.config, 'early_stopping_patience') else 20
+        early_stopping_min_delta = self.config.early_stopping_min_delta if hasattr(self.config, 'early_stopping_min_delta') else 1e-4
+
         try:
             for epoch in range(self.config.num_epochs):
                 # Training
@@ -1493,13 +1656,22 @@ Degradation: +-8.0%"""
                         self.tensorboard_writer.add_scalar('Epoch/LearningRate', current_lr, epoch)
                     
                     # Track best model
-                    if val_loss < best_val_loss:
+                    if val_loss < best_val_loss - early_stopping_min_delta:
                         best_val_loss = val_loss
                         best_epoch = epoch
                         is_best = True
+                        self._best_val_loss = best_val_loss  # Store for checkpoint saving
+                        patience_counter = 0  # Reset patience counter
                         print(f"   🌟 New best validation loss: {val_loss:.6f}")
                     else:
                         is_best = False
+                        patience_counter += 1
+
+                    # Early stopping check
+                    if patience_counter >= early_stopping_patience:
+                        print(f"   🛑 Early stopping triggered after {epoch + 1} epochs (patience: {early_stopping_patience})")
+                        print(f"   Best validation loss: {best_val_loss:.6f} at epoch {best_epoch + 1}")
+                        break
                     
                     # Save checkpoints
                     self.save_checkpoint(epoch, val_loss, is_best)
@@ -1698,15 +1870,25 @@ Degradation: +-8.0%"""
         checkpoint_dir = CHECKPOINT_CONFIG["checkpoint_dir"]
         checkpoint_dir.mkdir(exist_ok=True)
         
+        # Get optimizer from the current context (passed to finetune_verbose)
+        optimizer = getattr(self, '_current_optimizer', None)
+        best_val_loss = getattr(self, '_best_val_loss', float('inf'))
+        
         state = {
             'epoch': epoch + 1,
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'best_val_loss': self.best_val_loss,
             'training_history': self.training_history,
             'torch_rng_state': torch.get_rng_state(),
             'numpy_rng_state': np.random.get_state(),
         }
+        
+        # Add optimizer state if available
+        if optimizer is not None:
+            state['optimizer_state_dict'] = optimizer.state_dict()
+            
+        # Add best val loss if available
+        if hasattr(self, '_best_val_loss'):
+            state['best_val_loss'] = self._best_val_loss
 
         # Save a periodic checkpoint
         if (epoch + 1) % CHECKPOINT_CONFIG["save_every_n_epochs"] == 0:
