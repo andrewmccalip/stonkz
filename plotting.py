@@ -47,8 +47,127 @@ PLOTS_DIR = SCRIPT_DIR / "prediction_plots"
 PLOTS_DIR.mkdir(exist_ok=True)
 
 # ==============================================================================
-# Main Plotting Function
+# Main Plotting Functions
 # ==============================================================================
+
+def plot_comprehensive_dashboard(
+    context_data,
+    prediction_data=None,
+    ground_truth_data=None,
+    title="Comprehensive Prediction Dashboard",
+    model_name="Model",
+    save_path=None,
+    show_plot=True,
+    figsize=None,
+    normalize_to_start=True,
+    epoch=0,
+    training_history=None,
+    verbose=False
+):
+    """
+    Create a comprehensive prediction dashboard with simplified layout.
+    
+    Layout:
+    - Top row (3-wide): Sample vs Prediction comparison
+    - Middle row (3-wide): Training and Validation Loss vs Epoch
+    - Bottom row: Additional analysis plots (simplified)
+    
+    Args:
+        context_data (array-like): Historical/context data
+        prediction_data (array-like): Model predictions  
+        ground_truth_data (array-like): Actual future values
+        title (str): Plot title
+        model_name (str): Name of the model
+        save_path (str/Path, optional): Path to save plot
+        show_plot (bool): Whether to display the plot
+        figsize (tuple, optional): Figure size (width, height)
+        normalize_to_start (bool): Whether to normalize data to start at 1.0
+        epoch (int): Current training epoch
+        training_history (dict, optional): Training history with 'train_loss' and 'val_loss' lists
+        verbose (bool): Print detailed information
+    
+    Returns:
+        dict: Dictionary containing plot information and metrics
+    """
+    
+    if verbose:
+        print(f"🎨 Creating comprehensive dashboard: {title}")
+    
+    # Prepare data
+    plot_data = _prepare_plot_data(
+        context_data, prediction_data, ground_truth_data, None,
+        None, normalize_to_start, verbose
+    )
+    
+    if plot_data is None:
+        print("❌ Failed to prepare plot data")
+        return None
+    
+    # Set figure size (increased height for 3 rows)
+    figsize = figsize or (20, 16)
+    
+    # Create figure with subplot layout: 3 rows, 3 columns
+    fig = plt.figure(figsize=figsize)
+    
+    # Top row: 3-wide sample vs prediction plot
+    ax_main = plt.subplot2grid((3, 3), (0, 0), colspan=3, fig=fig)
+    
+    # Middle row: Training and validation loss vs epoch (3-wide)
+    ax_loss = plt.subplot2grid((3, 3), (1, 0), colspan=3, fig=fig)
+    
+    # Bottom row: Additional plots (simplified)
+    ax_metrics = plt.subplot2grid((3, 3), (2, 0), fig=fig)
+    ax_residuals = plt.subplot2grid((3, 3), (2, 1), fig=fig)
+    ax_correlation = plt.subplot2grid((3, 3), (2, 2), fig=fig)
+    
+    # Plot main prediction comparison (3-wide top panel)
+    _plot_comprehensive_main(ax_main, plot_data, model_name, epoch, verbose)
+    
+    # Plot training and validation loss (3-wide middle panel)
+    _plot_training_loss(ax_loss, training_history, epoch, verbose)
+    
+    # Plot simplified bottom panels
+    metrics = {}
+    if plot_data['prediction'] is not None and plot_data['ground_truth'] is not None:
+        metrics = _calculate_metrics(plot_data['prediction'], plot_data['ground_truth'])
+        _plot_metrics_summary(ax_metrics, metrics, model_name)
+        _plot_residuals_analysis(ax_residuals, plot_data, metrics)
+        _plot_correlation_analysis(ax_correlation, plot_data, metrics)
+    
+    # Format the overall plot
+    fig.suptitle(title, fontsize=16, fontweight='bold', y=0.95)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.93])
+    
+    # Save plot
+    if save_path is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = PLOTS_DIR / f"{model_name.lower()}_dashboard_{timestamp}.png"
+    else:
+        save_path = Path(save_path)
+    
+    plt.savefig(save_path, dpi=DEFAULT_STYLE['dpi'], bbox_inches='tight', facecolor='white')
+    
+    if verbose:
+        print(f"💾 Dashboard saved to: {save_path}")
+    
+    # Show plot if requested
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
+    
+    # Return results
+    result = {
+        'plot_path': save_path,
+        'metrics': metrics,
+        'plot_data': plot_data,
+        'figure_size': figsize
+    }
+    
+    if verbose:
+        print(f"✅ Dashboard creation completed")
+    
+    return result
 
 def plot_prediction_results(
     context_data,
@@ -674,3 +793,217 @@ if __name__ == "__main__":
     
     print(f"\n📁 All test plots saved to: {PLOTS_DIR}")
     print("🎨 Plotting module ready for use!")
+
+# ==============================================================================
+# Comprehensive Dashboard Helper Functions
+# ==============================================================================
+
+def _plot_comprehensive_main(ax, plot_data, model_name, epoch, verbose):
+    """Plot the main 3-wide prediction comparison"""
+    
+    context = plot_data['context']
+    prediction = plot_data['prediction']
+    ground_truth = plot_data['ground_truth']
+    context_time = plot_data['context_timestamps']
+    pred_time = plot_data['prediction_timestamps']
+    
+    # Ensure pred_len is always defined
+    pred_len = len(prediction) if prediction is not None else 0
+
+    # Plot context (historical data) - using same style as plot_prediction_results
+    ax.plot(context_time, context, color=COLORS['historical'], 
+            linewidth=DEFAULT_STYLE['line_width'], label='Historical Data', 
+            alpha=DEFAULT_STYLE['line_alpha'])
+    
+    # Add reference line for normalized data
+    if plot_data.get('normalized', True):
+        ax.axhline(y=1.0, color=COLORS['reference'], linestyle=':', 
+                  alpha=0.5, linewidth=1, label='Normalized Start (1.00)')
+    
+    # Plot predictions and ground truth if available
+    if prediction is not None:
+        ax.plot(pred_time, prediction, color=COLORS['prediction'], 
+                linewidth=DEFAULT_STYLE['line_width'], 
+                label=f'{model_name} Fine-tuned Prediction', 
+                alpha=DEFAULT_STYLE['line_alpha'])
+        
+        # Connect context to prediction with thin line
+        if len(context) > 0 and len(pred_time) > 0:
+            last_context_time = context_time[-1]
+            last_context_price = context[-1]
+            first_pred_time = pred_time[0]
+            first_pred_price = prediction[0]
+            
+            ax.plot([last_context_time, first_pred_time], 
+                   [last_context_price, first_pred_price],
+                   color=COLORS['prediction'], linewidth=1, alpha=0.3)
+        
+        if ground_truth is not None:
+            ax.plot(pred_time, ground_truth, color=COLORS['ground_truth'], 
+                    linewidth=DEFAULT_STYLE['line_width'], label='Ground Truth', 
+                    alpha=DEFAULT_STYLE['line_alpha'])
+    
+    # Add vertical line to separate context from prediction
+    if pred_len > 0:
+        ax.axvline(x=context_time[-1] if len(context_time) > 0 else context_len, 
+                   color=COLORS['current_time'], linestyle='--', linewidth=2, 
+                   alpha=0.6, label='Prediction Start')
+    
+    # Calculate and add metrics box (like in the original plot_prediction_results)
+    if prediction is not None and ground_truth is not None:
+        metrics = _calculate_metrics(prediction, ground_truth)
+        _add_metrics_text(ax, metrics, model_name)
+    
+    # Formatting - using same style as plot_prediction_results
+    ax.set_title(f'Test {model_name} Fine-tuning - Epoch {epoch + 1}', 
+                fontsize=DEFAULT_STYLE['title_fontsize'], fontweight='bold')
+    ax.set_xlabel('Time', fontsize=DEFAULT_STYLE['label_fontsize'])
+    ax.set_ylabel('Normalized Price', fontsize=DEFAULT_STYLE['label_fontsize'])
+    ax.grid(True, alpha=DEFAULT_STYLE['grid_alpha'])
+    ax.legend(loc='upper left', fontsize=DEFAULT_STYLE['legend_fontsize'])
+    
+    # Set y-axis to focus on the data range
+    if prediction is not None and ground_truth is not None:
+        all_values = np.concatenate([context, prediction, ground_truth])
+        y_margin = (np.max(all_values) - np.min(all_values)) * 0.05
+        ax.set_ylim(np.min(all_values) - y_margin, np.max(all_values) + y_margin)
+
+def _plot_training_loss(ax, training_history, epoch, verbose):
+    """Plot training and validation loss over epochs"""
+    
+    if training_history is None or not training_history:
+        ax.text(0.5, 0.5, 'No training history\navailable', 
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=12, alpha=0.6)
+        ax.set_title('Training & Validation Loss', fontsize=12, fontweight='bold')
+        return
+    
+    train_losses = training_history.get('train_loss', [])
+    val_losses = training_history.get('val_loss', [])
+    
+    if not train_losses and not val_losses:
+        ax.text(0.5, 0.5, 'No loss data\navailable', 
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=12, alpha=0.6)
+        ax.set_title('Training & Validation Loss', fontsize=12, fontweight='bold')
+        return
+    
+    # Create epoch axis
+    epochs = np.arange(1, len(train_losses) + 1) if train_losses else np.arange(1, len(val_losses) + 1)
+    
+    # Plot training loss
+    if train_losses:
+        ax.plot(epochs[:len(train_losses)], train_losses, 'b-', linewidth=2, 
+                label='Training Loss', alpha=0.8)
+    
+    # Plot validation loss
+    if val_losses:
+        val_epochs = np.arange(1, len(val_losses) + 1)
+        ax.plot(val_epochs, val_losses, 'r-', linewidth=2, 
+                label='Validation Loss', alpha=0.8)
+    
+    # Highlight current epoch
+    if epoch < len(train_losses):
+        current_train_loss = train_losses[epoch]
+        ax.plot(epoch + 1, current_train_loss, 'bo', markersize=8, 
+                label=f'Current Epoch ({epoch + 1})')
+    
+    # Formatting
+    ax.set_title('Training & Validation Loss vs Epoch', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    ax.set_yscale('log')  # Log scale for better visualization
+    
+    # Add text with current values
+    if train_losses and val_losses:
+        current_train = train_losses[-1] if train_losses else 0
+        current_val = val_losses[-1] if val_losses else 0
+        best_val = min(val_losses) if val_losses else 0
+        
+        info_text = f"Current Train: {current_train:.6f}\nCurrent Val: {current_val:.6f}\nBest Val: {best_val:.6f}"
+        ax.text(0.02, 0.98, info_text, transform=ax.transAxes, 
+                verticalalignment='top', fontsize=10,
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+
+def _plot_metrics_summary(ax, metrics, model_name):
+    """Plot a summary of key metrics"""
+    
+    ax.axis('off')  # Turn off axes for text display
+    
+    # Create metrics text
+    metrics_text = f"{model_name} Performance Metrics\n" + "="*35 + "\n\n"
+    
+    if 'mse' in metrics:
+        metrics_text += f"MSE: {metrics['mse']:.6f}\n"
+    if 'mae' in metrics:
+        metrics_text += f"MAE: {metrics['mae']:.6f}\n"
+    if 'rmse' in metrics:
+        metrics_text += f"RMSE: {metrics['rmse']:.6f}\n"
+    if 'directional_accuracy' in metrics:
+        metrics_text += f"Directional Accuracy: {metrics['directional_accuracy']:.1%}\n"
+    if 'correlation' in metrics:
+        metrics_text += f"Correlation: {metrics['correlation']:.4f}\n"
+    
+    # Add the text to the plot
+    ax.text(0.05, 0.95, metrics_text, transform=ax.transAxes, 
+            fontsize=11, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightblue', alpha=0.3))
+
+def _plot_residuals_analysis(ax, plot_data, metrics):
+    """Plot residuals analysis"""
+    
+    prediction = plot_data['prediction']
+    ground_truth = plot_data['ground_truth']
+    
+    if prediction is not None and ground_truth is not None:
+        residuals = prediction - ground_truth
+        
+        # Plot residuals over time
+        ax.plot(residuals, color='red', linewidth=2, alpha=0.7)
+        ax.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+        ax.axhline(y=np.mean(residuals), color='blue', linestyle='--', alpha=0.7, 
+                   label=f'Mean: {np.mean(residuals):.4f}')
+        
+        ax.set_title('Prediction Residuals', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Time Step')
+        ax.set_ylabel('Residual (Pred - Truth)')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, 'No residuals data\navailable', 
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=12, alpha=0.6)
+
+def _plot_correlation_analysis(ax, plot_data, metrics):
+    """Plot correlation analysis"""
+    
+    prediction = plot_data['prediction']
+    ground_truth = plot_data['ground_truth']
+    
+    if prediction is not None and ground_truth is not None:
+        # Scatter plot of predictions vs ground truth
+        ax.scatter(ground_truth, prediction, alpha=0.6, color=COLORS['prediction'])
+        
+        # Add perfect prediction line
+        min_val = min(np.min(ground_truth), np.min(prediction))
+        max_val = max(np.max(ground_truth), np.max(prediction))
+        ax.plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.5, 
+                label='Perfect Prediction')
+        
+        # Add correlation info
+        if 'correlation' in metrics:
+            ax.text(0.05, 0.95, f"Correlation: {metrics['correlation']:.4f}", 
+                    transform=ax.transAxes, fontsize=11,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        ax.set_title('Prediction vs Ground Truth', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Ground Truth')
+        ax.set_ylabel('Prediction')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, 'No correlation data\navailable', 
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=12, alpha=0.6)
