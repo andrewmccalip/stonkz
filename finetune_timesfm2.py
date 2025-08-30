@@ -85,15 +85,15 @@ class ModelConfig:
     """Configuration for TimesFM model parameters"""
     repo_id: str = "google/timesfm-2.0-500m-pytorch"
     context_len: int = 800  # EXPANDED: Capture more complete market context (~13.3 hours)
-    horizon_len: int = 400  # EXPANDED: Longer prediction window (~6.7 hours)
+    horizon_len: int = 128  # TimesFM's fixed architecture constraint
     num_layers: int = 50
-    per_core_batch_size: int = 4   # ADJUSTED: Matches 16 total batch size for small dataset
+    per_core_batch_size: int = 16  # MAXIMUM: Matches 64 total batch size for optimal GPU utilization
     use_positional_embedding: bool = True
 
 @dataclass
 class TrainingConfig:
     """Configuration for training parameters"""
-    batch_size: int = 16   # ADJUSTED: With only ~53 sessions, smaller batches for better gradient estimates
+    batch_size: int = 50   # OPTIMAL: Safe batch size to avoid OOM with 800-context windows
     num_epochs: int = 200  # INCREASED: With only ~53 unique sessions, need more epochs for convergence
     learning_rate: float = 5e-5
     weight_decay: float = 0.01
@@ -118,7 +118,7 @@ class DataConfig:
     val_end_date: str = "2022-12-31"
     test_start_date: str = "2023-01-01"
     context_minutes: int = 800   # EXPANDED: Full market context
-    prediction_minutes: int = 400  # EXPANDED: Longer prediction horizon
+    prediction_minutes: int = 128  # TimesFM's fixed architecture constraint (~2.1 hours)
     use_sample: bool = True
     total_sequences: int = 100000
     train_ratio: float = 0.7
@@ -622,8 +622,8 @@ class ESFuturesSequenceDataset(Dataset):
         context = torch.tensor(sequence['context'], dtype=torch.float32)
         horizon = torch.tensor(sequence['horizon'], dtype=torch.float32)
         
-        # Pad horizon to match model's expected horizon length (128)
-        model_horizon_len = 128
+        # Pad horizon to match model's expected horizon length
+        model_horizon_len = self.horizon_length  # Use the configured horizon length
         if len(horizon) < model_horizon_len:
             # Pad with the last value
             padding_needed = model_horizon_len - len(horizon)
